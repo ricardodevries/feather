@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Linux development libraries
+        run: sudo apt-get update && sudo apt-get install --yes libudev-dev pkg-config
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run tests
+        run: cargo test --locked --workspace --all-targets --all-features
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --no-deps --all-features
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit dependencies
+        run: cargo audit
+      - name: Build release executables
+        run: cargo build --locked --workspace --release
+      - name: Verify the systemd unit
+        run: |
+          sudo install -m0755 target/release/feather /usr/local/bin/feather
+          sudo install -m0755 target/release/featherd /usr/local/bin/featherd
+          systemd-analyze verify packaging/systemd/featherd.service

@@ -1,0 +1,170 @@
+schema_version = 1
+default_profile = "balanced"
+
+[daemon]
+poll_interval = "3s"
+stale_after = "10s"
+socket = "/run/feather/feather.sock"
+state_file = "/var/lib/feather/state.json"
+failure_limit = 5
+
+[devices.hub]
+driver = "corsair-icue-link"
+vendor_id = 0x1b1c
+product_id = 0x0c3f
+unique_id = "REPLACE_WITH_HID_UNIQUE_ID"
+interface = 0
+expected_fan_count = 13
+
+[devices.gpu0]
+driver = "nvidia-nvml"
+uuid = "GPU-REPLACE_WITH_FIRST_UUID"
+
+[devices.gpu1]
+driver = "nvidia-nvml"
+uuid = "GPU-REPLACE_WITH_SECOND_UUID"
+
+[sensors.cpu]
+driver = "linux-hwmon"
+device = "0000:00:18.3"
+chip = "k10temp"
+label = "Tctl"
+
+[sensors.gpu0]
+driver = "nvidia-nvml"
+device = "gpu0"
+
+[sensors.gpu1]
+driver = "nvidia-nvml"
+device = "gpu1"
+
+[curves.quiet]
+points = [
+  { temp = 40, percent = 30 },
+  { temp = 55, percent = 40 },
+  { temp = 70, percent = 70 },
+  { temp = 80, percent = 100 },
+]
+
+[curves.balanced]
+points = [
+  { temp = 40, percent = 35 },
+  { temp = 50, percent = 45 },
+  { temp = 60, percent = 65 },
+  { temp = 70, percent = 85 },
+  { temp = 80, percent = 100 },
+]
+
+[curves.performance]
+points = [
+  { temp = 35, percent = 45 },
+  { temp = 50, percent = 65 },
+  { temp = 65, percent = 85 },
+  { temp = 75, percent = 100 },
+]
+
+[color_curves.temperature]
+points = [
+  { temp = 40, rgb = [0, 80, 0] },
+  { temp = 60, rgb = [255, 200, 0] },
+  { temp = 75, rgb = [255, 0, 0] },
+]
+
+[schedules.night]
+start = "22:00"
+end = "07:00"
+
+[outputs.case_fans]
+kind = "fan"
+device = "hub"
+channels = []
+minimum_percent = 35
+fail_safe_percent = 100
+hysteresis_percent = 2
+refresh_interval = "2s"
+
+[outputs.gpu0_fans]
+kind = "fan"
+device = "gpu0"
+channels = []
+minimum_percent = 35
+fail_safe_percent = 100
+hysteresis_percent = 2
+refresh_interval = "2s"
+
+[outputs.gpu1_fans]
+kind = "fan"
+device = "gpu1"
+channels = []
+minimum_percent = 35
+fail_safe_percent = 100
+hysteresis_percent = 2
+refresh_interval = "2s"
+
+[outputs.case_lighting]
+kind = "rgb"
+device = "hub"
+led_count = 22
+
+[profiles.quiet.outputs.case_fans]
+sources = ["cpu", "gpu0", "gpu1"]
+aggregate = "max"
+curve = "quiet"
+
+[profiles.quiet.outputs.gpu0_fans]
+sources = ["gpu0"]
+aggregate = "max"
+curve = "quiet"
+
+[profiles.quiet.outputs.gpu1_fans]
+sources = ["gpu1"]
+aggregate = "max"
+curve = "quiet"
+
+[profiles.quiet.outputs.case_lighting]
+sources = ["cpu", "gpu0", "gpu1"]
+aggregate = "max"
+color_curve = "temperature"
+off_schedule = "night"
+
+[profiles.balanced.outputs.case_fans]
+sources = ["cpu", "gpu0", "gpu1"]
+aggregate = "max"
+curve = "balanced"
+
+[profiles.balanced.outputs.gpu0_fans]
+sources = ["gpu0"]
+aggregate = "max"
+curve = "balanced"
+
+[profiles.balanced.outputs.gpu1_fans]
+sources = ["gpu1"]
+aggregate = "max"
+curve = "balanced"
+
+[profiles.balanced.outputs.case_lighting]
+sources = ["cpu", "gpu0", "gpu1"]
+aggregate = "max"
+color_curve = "temperature"
+off_schedule = "night"
+
+[profiles.performance.outputs.case_fans]
+sources = ["cpu", "gpu0", "gpu1"]
+aggregate = "max"
+curve = "performance"
+
+[profiles.performance.outputs.gpu0_fans]
+sources = ["gpu0"]
+aggregate = "max"
+curve = "performance"
+
+[profiles.performance.outputs.gpu1_fans]
+sources = ["gpu1"]
+aggregate = "max"
+curve = "performance"
+
+[profiles.performance.outputs.case_lighting]
+sources = ["cpu", "gpu0", "gpu1"]
+aggregate = "max"
+color_curve = "temperature"
+off_schedule = "night"

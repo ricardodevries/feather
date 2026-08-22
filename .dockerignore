@@ -1,0 +1,6 @@
+.git
+.agents
+target
+dist
+.DS_Store
+config.server.toml

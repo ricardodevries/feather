@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  amd64:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the tag against the package version
+        run: |
+          version=$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Build and test the amd64 artifact
+        run: ./scripts/build-amd64.sh
+      - name: Create the release archive
+        run: |
+          archive="feather-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -C dist -czf "dist/$archive" x86_64-unknown-linux-gnu
+          (cd dist && sha256sum "$archive" > "$archive.sha256")
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="dist/feather-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz"
+          gh release create "$GITHUB_REF_NAME" \
+            "$archive" \
+            "$archive.sha256" \
+            --generate-notes \
+            --title "Feather $GITHUB_REF_NAME" \
+            --verify-tag

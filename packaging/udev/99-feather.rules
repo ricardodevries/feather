@@ -1,0 +1,2 @@
+# featherd runs as root. Client socket membership does not grant direct HID access.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1b1c", ATTRS{idProduct}=="0c3f", OWNER="root", GROUP="root", MODE="0600"

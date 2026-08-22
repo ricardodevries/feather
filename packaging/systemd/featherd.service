@@ -1,0 +1,49 @@
+[Unit]
+Description=Feather thermal control daemon
+After=local-fs.target systemd-udevd.service
+Wants=systemd-udevd.service
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStartPre=/usr/local/bin/feather config check /etc/feather/config.toml
+ExecStart=/usr/local/bin/featherd --config /etc/feather/config.toml
+ExecReload=/usr/local/bin/feather config reload
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=15s
+WatchdogSec=15s
+User=root
+Group=feather
+UMask=0077
+RuntimeDirectory=feather
+RuntimeDirectoryMode=0770
+StateDirectory=feather
+StateDirectoryMode=0750
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/feather /var/lib/feather
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+IPAddressDeny=any
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @reboot @swap
+
+[Install]
+WantedBy=multi-user.target

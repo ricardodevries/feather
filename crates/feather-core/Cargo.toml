@@ -1,0 +1,24 @@
+[package]
+name = "feather-core"
+description = "Shared configuration and local protocol types for Feather"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+humantime-serde.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
+toml.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile.workspace = true
