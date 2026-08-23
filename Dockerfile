@@ -11,6 +11,8 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY config.example.toml README.md LICENSE.md ./
+COPY assets ./assets
+COPY docs ./docs
 COPY packaging ./packaging
 COPY scripts ./scripts
 
@@ -55,3 +57,5 @@ COPY packaging /packaging
 COPY scripts/install-server.sh /install-server.sh
 COPY scripts/uninstall-server.sh /uninstall-server.sh
 COPY README.md LICENSE.md /
+COPY assets /assets
+COPY docs /docs

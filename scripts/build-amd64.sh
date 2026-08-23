@@ -30,6 +30,10 @@ set -- \
   uninstall-server.sh \
   README.md \
   LICENSE.md \
+  assets/feather-logo.png \
+  docs/configuration.md \
+  docs/operations.md \
+  docs/development.md \
   packaging/systemd/featherd.service \
   packaging/sysusers/feather.conf \
   packaging/tmpfiles/feather.conf \
