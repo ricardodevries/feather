@@ -21,6 +21,9 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tracing_subscriber::EnvFilter;
 
+mod doctor;
+mod fan_test;
+
 const DEFAULT_SOCKET: &str = "/run/feather/feather.sock";
 const HEALTH_CHECK_FAILED: u8 = 5;
 
@@ -104,6 +107,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Check the local socket, daemon, sensors, outputs, and device discovery.
+    Doctor {
+        /// Emit the complete report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Validate or reload configuration.
     Config {
         #[command(subcommand)]
@@ -119,7 +128,7 @@ enum Commands {
         #[command(subcommand)]
         command: OverrideCommand,
     },
-    /// Release or resume daemon ownership of outputs.
+    /// Manage daemon-owned outputs and run fan tests.
     Output {
         #[command(subcommand)]
         command: OutputCommand,
@@ -267,6 +276,32 @@ enum OutputCommand {
         #[arg(long, conflicts_with = "output")]
         all: bool,
     },
+    /// Sweep a fan output through fixed duties and compare channel RPM.
+    Test {
+        /// Named fan output. The output must report per-channel RPM.
+        output: String,
+        /// Comma-separated fan duties tested in ascending order.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "35,50,75,100",
+            value_parser = clap::value_parser!(u8).range(0..=100)
+        )]
+        steps: Vec<u8>,
+        /// Time allowed for fan speed to settle at each duty.
+        #[arg(long, default_value = "15s", value_parser = parse_duration)]
+        hold: Duration,
+        /// Flag a channel below this percentage of its peers' median RPM.
+        #[arg(
+            long = "minimum-relative",
+            default_value_t = 75,
+            value_parser = clap::value_parser!(u8).range(1..=100)
+        )]
+        minimum_relative_percent: u8,
+        /// Emit the completed report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -311,6 +346,7 @@ async fn try_main() -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::Doctor { json } => doctor::run(&socket, json).await,
         Commands::Config { command } => match command {
             ConfigCommand::Check { path } => {
                 Config::from_path(&path)?;
@@ -375,10 +411,7 @@ async fn try_main() -> Result<ExitCode> {
             handle_override(&socket, command).await?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Output { command } => {
-            handle_output(&socket, command).await?;
-            Ok(ExitCode::SUCCESS)
-        }
+        Commands::Output { command } => handle_output(&socket, command).await,
         Commands::Debug { command } => match command {
             DebugCommand::HidDump { device } => {
                 let data = send_request(&socket, Command::DebugHidDump { device }).await?;
@@ -484,7 +517,7 @@ async fn handle_override(socket: &std::path::Path, command: OverrideCommand) -> 
     print_json(&data)
 }
 
-async fn handle_output(socket: &std::path::Path, command: OutputCommand) -> Result<()> {
+async fn handle_output(socket: &std::path::Path, command: OutputCommand) -> Result<ExitCode> {
     let command = match command {
         OutputCommand::Release { output, all } => {
             require_target(&output, all)?;
@@ -494,9 +527,27 @@ async fn handle_output(socket: &std::path::Path, command: OutputCommand) -> Resu
             require_target(&output, all)?;
             Command::OutputResume { output }
         }
+        OutputCommand::Test {
+            output,
+            steps,
+            hold,
+            minimum_relative_percent,
+            json,
+        } => {
+            return fan_test::run(
+                socket,
+                &output,
+                &steps,
+                hold,
+                minimum_relative_percent,
+                json,
+            )
+            .await;
+        }
     };
     let data = send_request(socket, command).await?;
-    print_json(&data)
+    print_json(&data)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn require_target(output: &Option<String>, all: bool) -> Result<()> {
@@ -744,6 +795,52 @@ mod tests {
         assert!(require_target(&None, false).is_err());
         assert!(require_target(&None, true).is_ok());
         assert!(require_target(&Some("case".into()), false).is_ok());
+    }
+
+    #[test]
+    fn parses_fan_test_options() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from([
+            "feather",
+            "output",
+            "test",
+            "front_fans",
+            "--steps",
+            "40,70,100",
+            "--hold",
+            "10s",
+            "--minimum-relative",
+            "70",
+            "--json",
+        ])?;
+        let Commands::Output {
+            command:
+                OutputCommand::Test {
+                    output,
+                    steps,
+                    hold,
+                    minimum_relative_percent,
+                    json,
+                },
+        } = cli.command
+        else {
+            anyhow::bail!("fan test parsed as another command");
+        };
+        assert_eq!(output, "front_fans");
+        assert_eq!(steps, vec![40, 70, 100]);
+        assert_eq!(hold, Duration::from_secs(10));
+        assert_eq!(minimum_relative_percent, 70);
+        assert!(json);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_doctor() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["feather", "doctor", "--json"])?;
+        let Commands::Doctor { json } = cli.command else {
+            anyhow::bail!("doctor parsed as another command");
+        };
+        assert!(json);
+        Ok(())
     }
 
     #[test]

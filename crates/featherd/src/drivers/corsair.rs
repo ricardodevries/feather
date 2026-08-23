@@ -22,6 +22,7 @@ const BUFFER_SIZE: usize = 512;
 const WRITE_SIZE: usize = BUFFER_SIZE + 1;
 const HEADER: usize = 3;
 const WRITE_HEADER: usize = 4;
+const RECONNECT_DELAY: Duration = Duration::from_millis(100);
 
 const CMD_SOFTWARE_MODE: &[u8] = &[0x01, 0x03, 0x00, 0x02];
 const CMD_HARDWARE_MODE: &[u8] = &[0x01, 0x03, 0x00, 0x01];
@@ -135,17 +136,18 @@ impl CorsairDriver {
         config: &DeviceConfig,
         channel: u8,
     ) -> Result<f64> {
-        let hub = self.hub(alias, config)?;
-        hub.ensure_software_mode()?;
-        hub.temperatures()?
-            .into_iter()
-            .find(|(current, _)| *current == channel)
-            .map(|(_, value)| value)
-            .ok_or_else(|| {
-                FeatherError::Driver(format!(
-                    "hub '{alias}' did not report temperature channel {channel}"
-                ))
-            })
+        self.with_reconnect(alias, config, |hub| {
+            hub.ensure_software_mode()?;
+            hub.temperatures()?
+                .into_iter()
+                .find(|(current, _)| *current == channel)
+                .map(|(_, value)| value)
+                .ok_or_else(|| {
+                    FeatherError::Driver(format!(
+                        "hub '{alias}' did not report temperature channel {channel}"
+                    ))
+                })
+        })
     }
 
     pub(super) fn set_fans(
@@ -156,41 +158,42 @@ impl CorsairDriver {
         percent: u8,
         expected_fan_count: Option<u8>,
     ) -> Result<FanWrite> {
-        let hub = self.hub(alias, config)?;
-        hub.ensure_software_mode()?;
-        let topology = hub.devices()?;
-        let speeds_before = hub.speeds()?;
-        let selected = if channels.is_empty() {
-            automatic_speed_channels(&topology.devices, &speeds_before)
-        } else {
-            channels
-                .iter()
-                .map(|channel| {
-                    u8::try_from(*channel).map_err(|_| {
-                        FeatherError::Driver(format!("fan channel {channel} is too large"))
+        self.with_reconnect(alias, config, |hub| {
+            hub.ensure_software_mode()?;
+            let topology = hub.devices()?;
+            let speeds_before = hub.speeds()?;
+            let selected = if channels.is_empty() {
+                automatic_speed_channels(&topology.devices, &speeds_before)
+            } else {
+                channels
+                    .iter()
+                    .map(|channel| {
+                        u8::try_from(*channel).map_err(|_| {
+                            FeatherError::Driver(format!("fan channel {channel} is too large"))
+                        })
                     })
-                })
-                .collect::<Result<BTreeSet<_>>>()?
-        };
-        if selected.is_empty() {
-            return Err(FeatherError::Driver(format!(
-                "hub '{alias}' reported no controllable fan channels"
-            )));
-        }
-        let requested = selected
-            .iter()
-            .map(|channel| (*channel, percent))
-            .collect::<BTreeMap<_, _>>();
-        hub.set_speeds(&requested)?;
-        let speeds_after = hub.speeds()?;
-        Ok(fan_write_result(
-            alias,
-            percent,
-            expected_fan_count,
-            &topology,
-            &selected,
-            &speeds_after,
-        ))
+                    .collect::<Result<BTreeSet<_>>>()?
+            };
+            if selected.is_empty() {
+                return Err(FeatherError::Driver(format!(
+                    "hub '{alias}' reported no controllable fan channels"
+                )));
+            }
+            let requested = selected
+                .iter()
+                .map(|channel| (*channel, percent))
+                .collect::<BTreeMap<_, _>>();
+            hub.set_speeds(&requested)?;
+            let speeds_after = hub.speeds()?;
+            Ok(fan_write_result(
+                alias,
+                percent,
+                expected_fan_count,
+                &topology,
+                &selected,
+                &speeds_after,
+            ))
+        })
     }
 
     pub(super) fn set_rgb(
@@ -200,10 +203,11 @@ impl CorsairDriver {
         led_count: u16,
         rgb: [u8; 3],
     ) -> Result<Value> {
-        let hub = self.hub(alias, config)?;
-        hub.ensure_software_mode()?;
-        hub.set_rgb(led_count, rgb)?;
-        Ok(json!({ "rgb": rgb, "led_count": led_count }))
+        self.with_reconnect(alias, config, |hub| {
+            hub.ensure_software_mode()?;
+            hub.set_rgb(led_count, rgb)?;
+            Ok(json!({ "rgb": rgb, "led_count": led_count }))
+        })
     }
 
     pub(super) fn release(&mut self, alias: &str, config: &DeviceConfig) -> Result<()> {
@@ -217,28 +221,29 @@ impl CorsairDriver {
     }
 
     pub(super) fn debug_dump(&mut self, alias: &str, config: &DeviceConfig) -> Result<String> {
-        let hub = self.hub(alias, config)?;
-        let was_software_mode = hub.software_mode;
-        hub.ensure_software_mode()?;
         let expected_fan_count = match config {
             DeviceConfig::CorsairIcueLink {
                 expected_fan_count, ..
             } => *expected_fan_count,
             DeviceConfig::NvidiaNvml { .. } | DeviceConfig::WireViewProIi { .. } => None,
         };
-        let dump = hub.diagnostic_dump(expected_fan_count);
-        if was_software_mode {
-            return dump;
-        }
-        let restore = hub.hardware_mode();
-        match (dump, restore) {
-            (Ok(output), Ok(())) => Ok(output),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(read_error), Err(restore_error)) => Err(FeatherError::Driver(format!(
-                "{read_error}; hardware-mode restore also failed: {restore_error}"
-            ))),
-        }
+        self.with_reconnect(alias, config, |hub| {
+            let was_software_mode = hub.software_mode;
+            hub.ensure_software_mode()?;
+            let dump = hub.diagnostic_dump(expected_fan_count);
+            if was_software_mode {
+                return dump;
+            }
+            let restore = hub.hardware_mode();
+            match (dump, restore) {
+                (Ok(output), Ok(())) => Ok(output),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+                (Err(read_error), Err(restore_error)) => Err(FeatherError::Driver(format!(
+                    "{read_error}; hardware-mode restore also failed: {restore_error}"
+                ))),
+            }
+        })
     }
 
     pub(super) fn shutdown(&mut self) {
@@ -257,6 +262,52 @@ impl CorsairDriver {
         self.hubs
             .get_mut(alias)
             .ok_or_else(|| FeatherError::Driver(format!("hub '{alias}' could not be opened")))
+    }
+
+    fn with_reconnect<T>(
+        &mut self,
+        alias: &str,
+        config: &DeviceConfig,
+        mut operation: impl FnMut(&mut Hub) -> Result<T>,
+    ) -> Result<T> {
+        let first_error = match self.hub(alias, config).and_then(&mut operation) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        tracing::warn!(
+            device = alias,
+            error = %first_error,
+            "Corsair operation failed; reopening the HID device"
+        );
+        self.discard_hub(alias);
+        thread::sleep(RECONNECT_DELAY);
+        match self.hub(alias, config).and_then(&mut operation) {
+            Ok(value) => {
+                tracing::info!(device = alias, "Corsair HID device recovered");
+                Ok(value)
+            }
+            Err(retry_error) => {
+                self.discard_hub(alias);
+                Err(FeatherError::Driver(format!(
+                    "{first_error}; retry after reopening the Corsair hub failed: {retry_error}"
+                )))
+            }
+        }
+    }
+
+    fn discard_hub(&mut self, alias: &str) {
+        let Some(mut hub) = self.hubs.remove(alias) else {
+            return;
+        };
+        if let Err(error) = hub.hardware_mode() {
+            tracing::debug!(
+                device = alias,
+                %error,
+                "could not restore Corsair hardware mode before reopening"
+            );
+            hub.software_mode = false;
+            hub.color_open = false;
+        }
     }
 }
 

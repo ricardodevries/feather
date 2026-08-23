@@ -19,6 +19,7 @@ const PRODUCT_ID: u16 = 0x5740;
 const BAUD_RATE: u32 = 115_200;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const RTS_SETTLE_TIME: Duration = Duration::from_millis(10);
+const RECONNECT_DELAY: Duration = Duration::from_millis(100);
 const WELCOME_MESSAGE: &[u8] = b"Thermal Grizzly WireView Pro II\0";
 
 const CMD_READ_VENDOR_DATA: u8 = 0x01;
@@ -100,6 +101,17 @@ impl WireViewDriver {
         config: &DeviceConfig,
         target: DisplayTarget,
     ) -> Result<Value> {
+        retry_serial_operation(alias, RECONNECT_DELAY, || {
+            self.set_display_once(alias, config, target)
+        })
+    }
+
+    fn set_display_once(
+        &self,
+        alias: &str,
+        config: &DeviceConfig,
+        target: DisplayTarget,
+    ) -> Result<Value> {
         let serial = serial(config)?;
         let ports = enumerate()?;
         let port = find_port(&ports, serial).ok_or_else(|| {
@@ -133,6 +145,32 @@ impl WireViewDriver {
             "serial": serial,
             "firmware_version": firmware_version,
         }))
+    }
+}
+
+fn retry_serial_operation<T>(
+    alias: &str,
+    delay: Duration,
+    mut operation: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let first_error = match operation() {
+        Ok(value) => return Ok(value),
+        Err(error) => error,
+    };
+    tracing::warn!(
+        device = alias,
+        error = %first_error,
+        "WireView operation failed; reopening the serial device"
+    );
+    thread::sleep(delay);
+    match operation() {
+        Ok(value) => {
+            tracing::info!(device = alias, "WireView serial device recovered");
+            Ok(value)
+        }
+        Err(retry_error) => Err(FeatherError::Driver(format!(
+            "{first_error}; retry after reopening the WireView device failed: {retry_error}"
+        ))),
     }
 }
 
@@ -459,7 +497,41 @@ fn timeout_mode_name(mode: u8) -> Result<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    #[test]
+    fn retries_one_wireview_operation_after_an_error() -> anyhow::Result<()> {
+        let attempts = Cell::new(0);
+        let value = retry_serial_operation("wireview", Duration::ZERO, || {
+            let attempt = attempts.get() + 1;
+            attempts.set(attempt);
+            if attempt == 1 {
+                Err(FeatherError::Driver("first attempt failed".into()))
+            } else {
+                Ok(42)
+            }
+        })?;
+        assert_eq!(value, 42);
+        assert_eq!(attempts.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn stops_wireview_retries_after_the_second_error() -> anyhow::Result<()> {
+        let attempts = Cell::new(0);
+        let error = match retry_serial_operation::<()>("wireview", Duration::ZERO, || {
+            attempts.set(attempts.get() + 1);
+            Err(FeatherError::Driver("unavailable".into()))
+        }) {
+            Ok(()) => anyhow::bail!("two failed operations should return an error"),
+            Err(error) => error,
+        };
+        assert_eq!(attempts.get(), 2);
+        assert!(error.to_string().contains("retry after reopening"));
+        Ok(())
+    }
 
     #[test]
     fn supports_known_configuration_sizes() -> anyhow::Result<()> {
