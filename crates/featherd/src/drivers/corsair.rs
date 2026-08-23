@@ -224,7 +224,7 @@ impl CorsairDriver {
             DeviceConfig::CorsairIcueLink {
                 expected_fan_count, ..
             } => *expected_fan_count,
-            DeviceConfig::NvidiaNvml { .. } => None,
+            DeviceConfig::NvidiaNvml { .. } | DeviceConfig::WireViewProIi { .. } => None,
         };
         let dump = hub.diagnostic_dump(expected_fan_count);
         if was_software_mode {

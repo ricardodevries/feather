@@ -544,6 +544,22 @@ fn handle_command(command: Command, state: &mut DaemonState) -> Result<Value> {
                 .set_rgb_override(&output, rgb, Duration::from_millis(duration_ms))?;
             Ok(json!({ "output": output, "expires_in_ms": duration_ms }))
         }
+        Command::OverrideDisplay {
+            output,
+            enabled,
+            duration_ms,
+        } => {
+            state.engine.set_display_override(
+                &output,
+                enabled,
+                Duration::from_millis(duration_ms),
+            )?;
+            Ok(json!({
+                "output": output,
+                "enabled": enabled,
+                "expires_in_ms": duration_ms,
+            }))
+        }
         Command::OverrideClear { output } => {
             state.engine.clear_overrides(output.as_deref())?;
             Ok(json!({ "cleared": output.unwrap_or_else(|| "all".into()) }))
@@ -825,6 +841,15 @@ mod tests {
 
         fn set_rgb(&mut self, _alias: &str, _config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {
             Ok(json!({ "rgb": rgb }))
+        }
+
+        fn set_display(
+            &mut self,
+            _alias: &str,
+            _config: &OutputConfig,
+            target: crate::drivers::DisplayTarget,
+        ) -> Result<Value> {
+            Ok(json!({ "target": format!("{target:?}") }))
         }
 
         fn release(&mut self, _alias: &str, _config: &OutputConfig) -> Result<()> {

@@ -1,12 +1,12 @@
 # Feather
 
-Feather controls fans and lighting on Linux from named temperature sources. It supports Corsair iCUE LINK hardware, NVIDIA GPUs, and Linux hwmon sensors.
+Feather controls fans, lighting, and display backlights on Linux. It supports Corsair iCUE LINK hardware, NVIDIA GPUs, Linux hwmon sensors, and Thermal Grizzly WireView Pro II displays.
 
 The installation has two executables:
 
 | Executable | Responsibility |
 | --- | --- |
-| `featherd` | Owns the hardware, evaluates policy, exposes the local socket, and restores firmware policies during shutdown. |
+| `featherd` | Owns the hardware, evaluates policy, exposes the local socket, and restores fan policies during shutdown. |
 | `feather` | Sends commands to `featherd` and performs offline configuration checks. |
 
 `feather` has no HID, hwmon, NVML, or systemd dependency. It communicates through `/run/feather/feather.sock`. Feather does not expose a TCP listener or other remote-control transport.
@@ -20,8 +20,11 @@ Fan control can damage hardware when it is configured incorrectly. Start with co
 | `corsair-icue-link` | LINK subdevices, hub temperature channels, fan RPM, and endpoint diagnostics | Fan percentage and RGB color | USB vendor/product ID, HID serial, and interface |
 | `nvidia-nvml` | GPU name, UUID, temperature, fan count, speed, policy, and limits | Per-fan percentage and default-policy restore | GPU UUID |
 | `linux-hwmon` | Linux temperature inputs | None | Physical device path, chip name, and label |
+| `wire-view-pro-ii` | USB identity and current display configuration | Volatile display sleep and brightness | USB serial number |
 
 Corsair support covers the iCUE LINK System Hub at USB `1b1c:0c3f`. Other Corsair products may use different endpoints or packet formats.
+
+WireView support covers the Thermal Grizzly WireView Pro II at USB `0483:5740`. Feather communicates with its CDC/ACM serial port at 115200 baud. The implementation uses the device configuration and screen-refresh commands documented by the [wireview-linux](https://github.com/emaspa/wireview-linux) and [wireview-hwmon](https://github.com/emaspa/wireview-hwmon) projects. Feather contains an independent Rust implementation of the required protocol messages.
 
 ## NVIDIA implementation
 
@@ -36,12 +39,12 @@ The daemon loads `libnvidia-ml.so.1` from the installed NVIDIA driver. No NVIDIA
 - Configuration parsing rejects unknown fields, invalid percentages, missing references, ambiguous channels, and driver/output mismatches.
 - `featherd` checks hardware selectors before it reports ready.
 - A missing or stale required sensor sends its fan output to `fail_safe_percent`. RGB outputs turn off.
-- Repeated output-write failures stop the daemon after `daemon.failure_limit` attempts. Shutdown then restores firmware or driver control.
+- Repeated fan-write failures stop the daemon after `daemon.failure_limit` attempts. Shutdown then restores firmware or driver control. RGB and display failures remain degraded and retry without interrupting fan control.
 - systemd waits 30 seconds between restarts and stops retrying after three starts within five minutes.
 - A Corsair `expected_fan_count` mismatch marks the fan output and daemon as degraded. Feather continues controlling every fan channel the hub enumerates.
 - Overrides require a finite lifetime. Normal policy resumes after expiry. A fan override below `minimum_percent` also requires `--allow-below-minimum`.
 - Profiles assign every configured output on a hardware device or none of them. The Corsair hub changes hardware mode per device, not per output.
-- SIGINT, SIGTERM, config reload, and systemd stop perform cleanup. `SIGKILL`, a kernel crash, or sudden power loss cannot run cleanup.
+- SIGINT, SIGTERM, config reload, and systemd stop restore fan policies. A scheduled WireView display remains in its last state when the daemon stops, so a sleeping display stays off.
 - The socket server permits 32 concurrent clients and closes a request that takes longer than 10 seconds.
 
 ## Build x86_64 Linux artifacts on Apple Silicon
@@ -86,6 +89,7 @@ Use the reported values in `config.example.toml`:
 - Select NVIDIA devices by their `GPU-...` UUID rather than their current index.
 - Select a Corsair hub with its `unique_id` and `interface`.
 - Select an hwmon input with its physical `device`, `chip`, and `label`.
+- Select each WireView by its USB `serial`, not its current `/dev/ttyACM*` number.
 
 ## Configure
 
@@ -95,12 +99,14 @@ Start from [config.example.toml](config.example.toml). The configuration has six
 2. `devices` name physical controllers.
 3. `sensors` name temperatures from hwmon, NVML, or a Corsair hub channel.
 4. `curves`, `color_curves`, and `schedules` define policy data.
-5. `outputs` name fan channel groups or RGB strips.
+5. `outputs` name fan channel groups, RGB strips, or display backlights.
 6. `profiles` connect outputs to sensors and curves.
 
 An assignment uses the highest source temperature. Every listed source is required. A stale source puts the output in fail-safe mode.
 
 An empty fan `channels` list selects every reported NVIDIA fan. On a Corsair hub, it selects enumerated subdevices that support speed control, including a fan whose speed reading is unavailable. Feather also keeps available speed channels from unknown device models for compatibility.
+
+A WireView display output uses `brightness_percent`, static timeout mode, and a 30-second timeout interval outside its `off_schedule`. During the schedule, Feather sets brightness to zero and selects sleep mode with a five-second timeout. The screen turns off after five seconds. Feather changes only the running configuration, does not write to WireView NVM, and keeps the selected page.
 
 Set `expected_fan_count` on a Corsair device when the physical fan count is known. `feather status` reports a degraded output when the hub enumerates a different number. `feather debug hid-dump hub` lists each subdevice with its channel, model, device ID, and speed state.
 
@@ -164,6 +170,8 @@ feather profile set performance --persist
 feather override fan case_fans 55 --for 10m
 feather override fan case_fans 20 --for 30s --allow-below-minimum
 feather override led case_lighting 0 80 0 --for 30m
+feather override display wireview0_display off --for 30m
+feather override display wireview0_display on --for 10m
 feather override clear case_fans
 feather override clear --all
 

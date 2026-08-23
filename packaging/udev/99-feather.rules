@@ -1,2 +1,5 @@
 # featherd runs as root. Client socket membership does not grant direct HID access.
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1b1c", ATTRS{idProduct}=="0c3f", OWNER="root", GROUP="root", MODE="0600"
+
+# Thermal Grizzly WireView Pro II serial ports are owned by featherd.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", OWNER="root", GROUP="root", MODE="0600"

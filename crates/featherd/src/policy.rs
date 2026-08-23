@@ -18,12 +18,16 @@ use feather_core::{
     },
 };
 
-use crate::{VERSION, drivers::Hardware};
+use crate::{
+    VERSION,
+    drivers::{DisplayTarget, Hardware},
+};
 
 #[derive(Clone, Debug)]
 enum OverrideValue {
     Fan(u8),
     Rgb([u8; 3]),
+    Display(bool),
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +109,7 @@ impl Engine {
                     refresh_interval, ..
                 } => Some(*refresh_interval),
                 OutputConfig::Rgb { .. } => None,
+                OutputConfig::Display { .. } => None,
             })
             .min()
             .unwrap_or(self.config.daemon.poll_interval);
@@ -155,9 +160,13 @@ impl Engine {
             log_output_transition(&output_name, previous.as_ref(), current.as_ref());
         }
 
-        self.outputs
-            .values()
-            .any(|runtime| runtime.consecutive_failures >= self.config.daemon.failure_limit)
+        self.outputs.iter().any(|(name, runtime)| {
+            runtime.consecutive_failures >= self.config.daemon.failure_limit
+                && matches!(
+                    self.config.outputs.get(name),
+                    Some(OutputConfig::Fan { .. })
+                )
+        })
     }
 
     fn poll_sensors(&mut self, now: Instant) {
@@ -215,6 +224,21 @@ impl Engine {
             }
             (OutputConfig::Rgb { .. }, Some(OverrideValue::Rgb(rgb))) => {
                 return self.write_rgb(output_name, &output, rgb, Health::Healthy, now);
+            }
+            (
+                OutputConfig::Display {
+                    brightness_percent, ..
+                },
+                Some(OverrideValue::Display(enabled)),
+            ) => {
+                let target = if enabled {
+                    DisplayTarget::Awake {
+                        brightness_percent: *brightness_percent,
+                    }
+                } else {
+                    DisplayTarget::Sleep
+                };
+                return self.write_display(output_name, &output, target, now);
             }
             (_, Some(_)) => {
                 return Err(FeatherError::Daemon(format!(
@@ -328,6 +352,34 @@ impl Engine {
                         })?;
                 self.write_rgb(output_name, &output_config, rgb, health, now)
             }
+            OutputConfig::Display {
+                brightness_percent, ..
+            } => {
+                let scheduled_off = assignment.off_schedule.as_ref().is_some_and(|name| {
+                    self.config.schedules.get(name).is_some_and(|schedule| {
+                        schedule_active(
+                            local_now.hour(),
+                            local_now.minute(),
+                            &schedule.start,
+                            &schedule.end,
+                        )
+                    })
+                });
+                let target = if scheduled_off {
+                    DisplayTarget::Sleep
+                } else {
+                    DisplayTarget::Awake { brightness_percent }
+                };
+                let output_config =
+                    self.config
+                        .outputs
+                        .get(output_name)
+                        .cloned()
+                        .ok_or_else(|| {
+                            FeatherError::Config(format!("unknown output '{output_name}'"))
+                        })?;
+                self.write_display(output_name, &output_config, target, now)
+            }
         }
     }
 
@@ -343,7 +395,7 @@ impl Engine {
             OutputConfig::Fan {
                 refresh_interval, ..
             } => *refresh_interval,
-            OutputConfig::Rgb { .. } => Duration::ZERO,
+            OutputConfig::Rgb { .. } | OutputConfig::Display { .. } => Duration::ZERO,
         };
         let target = json!(percent);
         let needs_write = self.outputs.get(output_name).is_none_or(|runtime| {
@@ -400,6 +452,41 @@ impl Engine {
         Ok(())
     }
 
+    fn write_display(
+        &mut self,
+        output_name: &str,
+        config: &OutputConfig,
+        display_target: DisplayTarget,
+        now: Instant,
+    ) -> Result<()> {
+        let target = match display_target {
+            DisplayTarget::Awake { brightness_percent } => json!(brightness_percent),
+            DisplayTarget::Sleep => json!("sleep"),
+        };
+        let needs_write = self
+            .outputs
+            .get(output_name)
+            .is_none_or(|runtime| runtime.last_target.as_ref() != Some(&target));
+        if !needs_write {
+            let runtime = self.outputs.entry(output_name.into()).or_default();
+            runtime.health = Some(Health::Healthy);
+            runtime.error = None;
+            runtime.consecutive_failures = 0;
+            return Ok(());
+        }
+        let observed = self
+            .hardware
+            .set_display(output_name, config, display_target)?;
+        let runtime = self.outputs.entry(output_name.into()).or_default();
+        runtime.last_target = Some(target);
+        runtime.last_write = Some(now);
+        runtime.observed = Some(observed);
+        runtime.health = Some(Health::Healthy);
+        runtime.error = None;
+        runtime.consecutive_failures = 0;
+        Ok(())
+    }
+
     pub(crate) fn status(&self, now: Instant) -> DaemonStatus {
         let sensors: BTreeMap<String, SensorStatus> = self
             .config
@@ -449,6 +536,7 @@ impl Engine {
                         kind: match config {
                             OutputConfig::Fan { .. } => OutputKind::Fan,
                             OutputConfig::Rgb { .. } => OutputKind::Rgb,
+                            OutputConfig::Display { .. } => OutputKind::Display,
                         },
                         health: runtime
                             .and_then(|runtime| runtime.health.clone())
@@ -493,10 +581,12 @@ impl Engine {
                     kind: match active.value {
                         OverrideValue::Fan(_) => OverrideKind::Fan,
                         OverrideValue::Rgb(_) => OverrideKind::Rgb,
+                        OverrideValue::Display(_) => OverrideKind::Display,
                     },
                     value: match active.value {
                         OverrideValue::Fan(value) => json!(value),
                         OverrideValue::Rgb(value) => json!(value),
+                        OverrideValue::Display(value) => json!(value),
                     },
                     remaining_ms: duration_millis(active.expires_at.saturating_duration_since(now)),
                 })
@@ -571,6 +661,11 @@ impl Engine {
                     "output '{output}' is not a fan"
                 )));
             }
+            Some(OutputConfig::Display { .. }) => {
+                return Err(FeatherError::Daemon(format!(
+                    "output '{output}' is not a fan"
+                )));
+            }
             None => return Err(FeatherError::Daemon(format!("unknown output '{output}'"))),
         };
         if percent < minimum_percent && !allow_below_minimum {
@@ -605,7 +700,7 @@ impl Engine {
         }
         match self.config.outputs.get(output) {
             Some(OutputConfig::Rgb { .. }) => {}
-            Some(OutputConfig::Fan { .. }) => {
+            Some(OutputConfig::Fan { .. } | OutputConfig::Display { .. }) => {
                 return Err(FeatherError::Daemon(format!(
                     "output '{output}' is not RGB"
                 )));
@@ -620,6 +715,40 @@ impl Engine {
             output.into(),
             ActiveOverride {
                 value: OverrideValue::Rgb(rgb),
+                expires_at,
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn set_display_override(
+        &mut self,
+        output: &str,
+        enabled: bool,
+        ttl: Duration,
+    ) -> Result<()> {
+        if ttl.is_zero() {
+            return Err(FeatherError::Daemon(
+                "override duration must be greater than zero".into(),
+            ));
+        }
+        match self.config.outputs.get(output) {
+            Some(OutputConfig::Display { .. }) => {}
+            Some(OutputConfig::Fan { .. } | OutputConfig::Rgb { .. }) => {
+                return Err(FeatherError::Daemon(format!(
+                    "output '{output}' is not a display"
+                )));
+            }
+            None => return Err(FeatherError::Daemon(format!("unknown output '{output}'"))),
+        }
+        self.require_active_output(output)?;
+        let expires_at = Instant::now()
+            .checked_add(ttl)
+            .ok_or_else(|| FeatherError::Daemon("override duration is too large".into()))?;
+        self.overrides.insert(
+            output.into(),
+            ActiveOverride {
+                value: OverrideValue::Display(enabled),
                 expires_at,
             },
         );
@@ -862,7 +991,9 @@ fn fan_health(policy_health: &Health, has_hardware_warning: bool) -> Health {
 
 fn output_device(output: &OutputConfig) -> &str {
     match output {
-        OutputConfig::Fan { device, .. } | OutputConfig::Rgb { device, .. } => device,
+        OutputConfig::Fan { device, .. }
+        | OutputConfig::Rgb { device, .. }
+        | OutputConfig::Display { device, .. } => device,
     }
 }
 
@@ -951,10 +1082,34 @@ sources = ["cpu"]
 curve = "main"
 "#;
 
+    const DISPLAY_CONFIG: &str = r#"
+schema_version = 1
+default_profile = "balanced"
+
+[devices.wireview]
+driver = "wire-view-pro-ii"
+serial = "2090389E4245"
+
+[schedules.night]
+start = "22:00"
+end = "07:00"
+
+[outputs.gpu_display]
+kind = "display"
+device = "wireview"
+brightness_percent = 75
+
+[profiles.balanced.outputs.gpu_display]
+sources = []
+off_schedule = "night"
+"#;
+
     #[derive(Debug, Default)]
     struct FakeState {
         sensor: Option<f64>,
         fan_writes: Vec<(String, u8)>,
+        display_writes: Vec<(String, DisplayTarget)>,
+        display_error: Option<String>,
         fan_warning: Option<String>,
         releases: Vec<String>,
         preflights: usize,
@@ -1002,6 +1157,20 @@ curve = "main"
 
         fn set_rgb(&mut self, _alias: &str, _config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {
             Ok(json!({ "rgb": rgb }))
+        }
+
+        fn set_display(
+            &mut self,
+            alias: &str,
+            _config: &OutputConfig,
+            target: DisplayTarget,
+        ) -> Result<Value> {
+            let mut state = lock_state(&self.state);
+            if let Some(error) = &state.display_error {
+                return Err(FeatherError::Driver(error.clone()));
+            }
+            state.display_writes.push((alias.to_owned(), target));
+            Ok(json!({ "target": format!("{target:?}") }))
         }
 
         fn release(&mut self, alias: &str, _config: &OutputConfig) -> Result<()> {
@@ -1066,6 +1235,88 @@ curve = "main"
             lock_state(&state).fan_writes,
             vec![("case".into(), 75), ("case".into(), 50)]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn blanks_and_restores_a_display_across_the_night_schedule() -> anyhow::Result<()> {
+        let (mut engine, state) = test_engine(DISPLAY_CONFIG, None)?;
+        let now = Instant::now();
+        let night = Local::now()
+            .with_hour(23)
+            .and_then(|value| value.with_minute(0))
+            .ok_or_else(|| anyhow::anyhow!("could not construct night test time"))?;
+        let day = Local::now()
+            .with_hour(12)
+            .and_then(|value| value.with_minute(0))
+            .ok_or_else(|| anyhow::anyhow!("could not construct day test time"))?;
+
+        assert!(!engine.tick(now, night));
+        assert_eq!(
+            engine.status(now).outputs["gpu_display"].target,
+            Some(json!("sleep"))
+        );
+        assert!(!engine.tick(now + Duration::from_secs(1), day));
+
+        assert_eq!(
+            lock_state(&state).display_writes,
+            vec![
+                ("gpu_display".into(), DisplayTarget::Sleep),
+                (
+                    "gpu_display".into(),
+                    DisplayTarget::Awake {
+                        brightness_percent: 75,
+                    },
+                ),
+            ]
+        );
+        let status = engine.status(now + Duration::from_secs(1));
+        assert_eq!(status.outputs["gpu_display"].kind, OutputKind::Display);
+        assert_eq!(status.outputs["gpu_display"].target, Some(json!(75)));
+        Ok(())
+    }
+
+    #[test]
+    fn display_override_temporarily_replaces_the_schedule() -> anyhow::Result<()> {
+        let (mut engine, state) = test_engine(DISPLAY_CONFIG, None)?;
+        let now = Instant::now();
+        let day = Local::now()
+            .with_hour(12)
+            .and_then(|value| value.with_minute(0))
+            .ok_or_else(|| anyhow::anyhow!("could not construct day test time"))?;
+        engine.set_display_override("gpu_display", false, Duration::from_millis(100))?;
+
+        assert!(!engine.tick(now, day));
+        assert!(!engine.tick(now + Duration::from_secs(1), day));
+
+        assert_eq!(
+            lock_state(&state).display_writes,
+            vec![
+                ("gpu_display".into(), DisplayTarget::Sleep),
+                (
+                    "gpu_display".into(),
+                    DisplayTarget::Awake {
+                        brightness_percent: 75,
+                    },
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn display_failures_do_not_stop_fan_control() -> anyhow::Result<()> {
+        let (mut engine, state) = test_engine(DISPLAY_CONFIG, None)?;
+        lock_state(&state).display_error = Some("display unavailable".into());
+        let now = Instant::now();
+
+        for seconds in 0..10 {
+            assert!(!engine.tick(now + Duration::from_secs(seconds), Local::now()));
+        }
+
+        let status = engine.status(now + Duration::from_secs(10));
+        assert_eq!(status.health, Health::Degraded);
+        assert_eq!(status.outputs["gpu_display"].health, Health::Degraded);
         Ok(())
     }
 

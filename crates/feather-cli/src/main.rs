@@ -223,6 +223,16 @@ enum OverrideCommand {
         #[arg(long = "for", value_parser = parse_duration)]
         duration: Duration,
     },
+    /// Temporarily turn a display on or off.
+    Display {
+        /// Named display output.
+        output: String,
+        /// Requested display state.
+        state: DisplayState,
+        /// Override lifetime, such as `30s`, `10m`, or `1h`.
+        #[arg(long = "for", value_parser = parse_duration)]
+        duration: Duration,
+    },
     /// Clear one override or all active overrides.
     Clear {
         /// Named output whose override should be cleared.
@@ -231,6 +241,12 @@ enum OverrideCommand {
         #[arg(long, conflicts_with = "output")]
         all: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DisplayState {
+    On,
+    Off,
 }
 
 #[derive(Debug, Subcommand)]
@@ -450,6 +466,15 @@ async fn handle_override(socket: &std::path::Path, command: OverrideCommand) -> 
             rgb: [r, g, b],
             duration_ms: duration_ms(duration)?,
         },
+        OverrideCommand::Display {
+            output,
+            state,
+            duration,
+        } => Command::OverrideDisplay {
+            output,
+            enabled: matches!(state, DisplayState::On),
+            duration_ms: duration_ms(duration)?,
+        },
         OverrideCommand::Clear { output, all } => {
             require_target(&output, all)?;
             Command::OverrideClear { output }
@@ -609,6 +634,25 @@ fn preview_config(
                     let [red, green, blue] = rgb;
                     println!("  {output_name}: rgb({red},{green},{blue})");
                 }
+                OutputConfig::Display {
+                    brightness_percent, ..
+                } => {
+                    let scheduled_off = assignment.off_schedule.as_ref().is_some_and(|name| {
+                        config.schedules.get(name).is_some_and(|schedule| {
+                            schedule_active(
+                                local_now.hour(),
+                                local_now.minute(),
+                                &schedule.start,
+                                &schedule.end,
+                            )
+                        })
+                    });
+                    if scheduled_off {
+                        println!("  {output_name}: sleep");
+                    } else {
+                        println!("  {output_name}: brightness {brightness_percent}%");
+                    }
+                }
             }
         }
     }
@@ -643,10 +687,7 @@ fn print_status(status: &DaemonStatus) {
             "  {name}: {:?} {:?} target={} observed={}",
             output.kind,
             output.health,
-            output
-                .target
-                .as_ref()
-                .map_or_else(|| "none".into(), ToString::to_string),
+            format_status_value(output.target.as_ref()),
             output
                 .observed
                 .as_ref()
@@ -664,6 +705,14 @@ fn print_status(status: &DaemonStatus) {
                 active.output, active.value, active.remaining_ms
             );
         }
+    }
+}
+
+fn format_status_value(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(value) => value.to_string(),
+        None => "none".into(),
     }
 }
 
@@ -737,6 +786,26 @@ mod tests {
             anyhow::bail!("fan override parsed as another command");
         };
         assert!(allow_below_minimum);
+
+        let cli = Cli::try_parse_from([
+            "feather",
+            "override",
+            "display",
+            "gpu0_display",
+            "off",
+            "--for",
+            "10m",
+        ])?;
+        let Commands::Override {
+            command:
+                OverrideCommand::Display {
+                    state: DisplayState::Off,
+                    ..
+                },
+        } = cli.command
+        else {
+            anyhow::bail!("display override parsed as another command");
+        };
         Ok(())
     }
 

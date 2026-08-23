@@ -40,7 +40,7 @@ pub struct Config {
     /// Local-time schedules keyed by names.
     #[serde(default)]
     pub schedules: BTreeMap<String, ScheduleConfig>,
-    /// Controllable fan and RGB outputs keyed by names.
+    /// Controllable fan, RGB, and display outputs keyed by names.
     #[serde(default)]
     pub outputs: BTreeMap<String, OutputConfig>,
     /// Policy profiles keyed by names.
@@ -105,6 +105,11 @@ pub enum DeviceConfig {
     NvidiaNvml {
         /// UUID returned by NVML, including the `GPU-` prefix.
         uuid: String,
+    },
+    /// Thermal Grizzly WireView Pro II selected by its USB serial number.
+    WireViewProIi {
+        /// Stable USB serial shown by udev and `feather devices`.
+        serial: String,
     },
 }
 
@@ -179,7 +184,7 @@ pub struct ColorPoint {
     pub rgb: [u8; 3],
 }
 
-/// Half-open local-time window used to turn RGB outputs off.
+/// Half-open local-time window used to turn RGB and display outputs off.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleConfig {
@@ -219,6 +224,13 @@ pub enum OutputConfig {
         /// Number of LEDs written by each update.
         led_count: u16,
     },
+    /// Backlight on a Thermal Grizzly WireView Pro II display.
+    Display {
+        /// Device alias.
+        device: String,
+        /// Backlight percentage used outside the off schedule.
+        brightness_percent: u8,
+    },
 }
 
 const fn default_hysteresis() -> u8 {
@@ -251,7 +263,7 @@ pub struct AssignmentConfig {
     pub curve: Option<String>,
     /// Color curve name for an RGB output.
     pub color_curve: Option<String>,
-    /// Optional off-schedule name for an RGB output.
+    /// Optional off-schedule name for an RGB or display output.
     pub off_schedule: Option<String>,
 }
 
@@ -372,6 +384,14 @@ impl Config {
                         )));
                     }
                     format!("nvidia:{uuid}")
+                }
+                DeviceConfig::WireViewProIi { serial } => {
+                    if serial.trim().is_empty() {
+                        return Err(config_error(format!(
+                            "devices.{name}.serial must not be empty"
+                        )));
+                    }
+                    format!("wireview:{}", serial.to_ascii_uppercase())
                 }
             };
             if !selectors.insert(selector) {
@@ -503,8 +523,37 @@ impl Config {
                     }
                     device
                 }
+                OutputConfig::Display {
+                    device,
+                    brightness_percent,
+                } => {
+                    if !(1..=100).contains(brightness_percent) {
+                        return Err(config_error(format!(
+                            "outputs.{name}.brightness_percent must be from 1 through 100"
+                        )));
+                    }
+                    if !matches!(
+                        self.devices.get(device),
+                        Some(DeviceConfig::WireViewProIi { .. })
+                    ) {
+                        return Err(config_error(format!(
+                            "outputs.{name} requires a wire-view-pro-ii device"
+                        )));
+                    }
+                    device
+                }
             };
             require_key("device", name, device, &self.devices)?;
+            if matches!(output, OutputConfig::Fan { .. })
+                && !matches!(
+                    self.devices.get(device),
+                    Some(DeviceConfig::CorsairIcueLink { .. } | DeviceConfig::NvidiaNvml { .. })
+                )
+            {
+                return Err(config_error(format!(
+                    "outputs.{name} requires a fan-capable device"
+                )));
+            }
             if let OutputConfig::Fan { channels, .. } = output
                 && matches!(
                     self.devices.get(device),
@@ -524,6 +573,7 @@ impl Config {
             let mut all_fans = None;
             let mut fan_channels = BTreeMap::new();
             let mut rgb_output = None;
+            let mut display_output = None;
             for (output_name, output) in &self.outputs {
                 if output_device(output) != device_name {
                     continue;
@@ -562,6 +612,13 @@ impl Config {
                             )));
                         }
                     }
+                    OutputConfig::Display { .. } => {
+                        if let Some(previous) = display_output.replace(output_name.as_str()) {
+                            return Err(config_error(format!(
+                                "outputs.{output_name} and outputs.{previous} both claim the display on device '{device_name}'"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -578,11 +635,6 @@ impl Config {
                         "profiles.{profile_name}.outputs.{output_name} references an unknown output"
                     ))
                 })?;
-                if assignment.sources.is_empty() {
-                    return Err(config_error(format!(
-                        "profiles.{profile_name}.outputs.{output_name}.sources must not be empty"
-                    )));
-                }
                 for source in &assignment.sources {
                     if !self.sensors.contains_key(source) {
                         return Err(config_error(format!(
@@ -592,6 +644,11 @@ impl Config {
                 }
                 match output {
                     OutputConfig::Fan { .. } => {
+                        if assignment.sources.is_empty() {
+                            return Err(config_error(format!(
+                                "profiles.{profile_name}.outputs.{output_name}.sources must not be empty"
+                            )));
+                        }
                         let curve = assignment.curve.as_ref().ok_or_else(|| {
                             config_error(format!(
                                 "profiles.{profile_name}.outputs.{output_name} requires curve"
@@ -609,6 +666,11 @@ impl Config {
                         }
                     }
                     OutputConfig::Rgb { .. } => {
+                        if assignment.sources.is_empty() {
+                            return Err(config_error(format!(
+                                "profiles.{profile_name}.outputs.{output_name}.sources must not be empty"
+                            )));
+                        }
                         let curve = assignment.color_curve.as_ref().ok_or_else(|| {
                             config_error(format!(
                                 "profiles.{profile_name}.outputs.{output_name} requires color_curve"
@@ -622,6 +684,23 @@ impl Config {
                         if assignment.curve.is_some() {
                             return Err(config_error(format!(
                                 "profiles.{profile_name}.outputs.{output_name} is RGB and cannot use curve"
+                            )));
+                        }
+                        if let Some(schedule) = &assignment.off_schedule
+                            && !self.schedules.contains_key(schedule)
+                        {
+                            return Err(config_error(format!(
+                                "profiles.{profile_name}.outputs.{output_name} references unknown schedule '{schedule}'"
+                            )));
+                        }
+                    }
+                    OutputConfig::Display { .. } => {
+                        if !assignment.sources.is_empty()
+                            || assignment.curve.is_some()
+                            || assignment.color_curve.is_some()
+                        {
+                            return Err(config_error(format!(
+                                "profiles.{profile_name}.outputs.{output_name} is a display and accepts only off_schedule"
                             )));
                         }
                         if let Some(schedule) = &assignment.off_schedule
@@ -663,7 +742,9 @@ impl Config {
 
 fn output_device(output: &OutputConfig) -> &str {
     match output {
-        OutputConfig::Fan { device, .. } | OutputConfig::Rgb { device, .. } => device,
+        OutputConfig::Fan { device, .. }
+        | OutputConfig::Rgb { device, .. }
+        | OutputConfig::Display { device, .. } => device,
     }
 }
 
@@ -758,6 +839,28 @@ sources = ["cpu"]
 curve = "case"
 "#;
 
+    const DISPLAY: &str = r#"
+schema_version = 1
+default_profile = "balanced"
+
+[devices.gpu_display]
+driver = "wire-view-pro-ii"
+serial = "2090389E4245"
+
+[schedules.night]
+start = "22:00"
+end = "07:00"
+
+[outputs.gpu_display]
+kind = "display"
+device = "gpu_display"
+brightness_percent = 75
+
+[profiles.balanced.outputs.gpu_display]
+sources = []
+off_schedule = "night"
+"#;
+
     #[test]
     fn accepts_valid_config() -> anyhow::Result<()> {
         let config = Config::from_toml(VALID)?;
@@ -769,6 +872,47 @@ curve = "case"
                 ..
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_a_scheduled_wireview_display() -> anyhow::Result<()> {
+        let config = Config::from_toml(DISPLAY)?;
+        assert!(matches!(
+            config.devices.get("gpu_display"),
+            Some(DeviceConfig::WireViewProIi { serial }) if serial == "2090389E4245"
+        ));
+        assert!(matches!(
+            config.outputs.get("gpu_display"),
+            Some(OutputConfig::Display {
+                brightness_percent: 75,
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_display_with_temperature_sources() -> anyhow::Result<()> {
+        let invalid = DISPLAY.replace("sources = []", "sources = [\"missing\"]");
+        let Err(error) = Config::from_toml(&invalid) else {
+            anyhow::bail!("display temperature source was accepted");
+        };
+        assert!(error.to_string().contains("unknown sensor 'missing'"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_display_brightness_over_one_hundred() -> anyhow::Result<()> {
+        let invalid = DISPLAY.replace("brightness_percent = 75", "brightness_percent = 101");
+        let Err(error) = Config::from_toml(&invalid) else {
+            anyhow::bail!("display brightness over 100 was accepted");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("brightness_percent must be from 1 through 100")
+        );
         Ok(())
     }
 

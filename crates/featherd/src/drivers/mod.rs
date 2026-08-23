@@ -19,6 +19,12 @@ pub(crate) struct FanWrite {
     pub(crate) warning: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplayTarget {
+    Awake { brightness_percent: u8 },
+    Sleep,
+}
+
 #[cfg(target_os = "linux")]
 impl FanWrite {
     fn healthy(observed: Value) -> Self {
@@ -35,6 +41,8 @@ mod corsair;
 mod hwmon;
 #[cfg(target_os = "linux")]
 mod nvidia;
+#[cfg(target_os = "linux")]
+mod wireview;
 
 /// Hardware operations used by the policy engine.
 pub trait Hardware: Send + 'static {
@@ -77,6 +85,18 @@ pub trait Hardware: Send + 'static {
     /// Returns an error when the output is not RGB or its driver rejects the write.
     fn set_rgb(&mut self, alias: &str, config: &OutputConfig, rgb: [u8; 3]) -> Result<Value>;
 
+    /// Sets a configured display state and returns observed data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the output is not a display or its driver rejects the write.
+    fn set_display(
+        &mut self,
+        alias: &str,
+        config: &OutputConfig,
+        target: DisplayTarget,
+    ) -> Result<Value>;
+
     /// Restores the hardware policy for the physical device owning an output.
     ///
     /// # Errors
@@ -96,12 +116,13 @@ pub trait Hardware: Send + 'static {
 }
 
 #[cfg(target_os = "linux")]
-/// Linux hardware router for Corsair HID, hwmon, and NVIDIA NVML drivers.
+/// Linux hardware router for Corsair HID, hwmon, NVIDIA NVML, and WireView drivers.
 pub struct SystemHardware {
     devices: BTreeMap<String, DeviceConfig>,
     corsair: corsair::CorsairDriver,
     hwmon: hwmon::HwmonDriver,
     nvidia: nvidia::NvidiaDriver,
+    wireview: wireview::WireViewDriver,
 }
 
 #[cfg(target_os = "linux")]
@@ -113,6 +134,7 @@ impl SystemHardware {
             corsair: corsair::CorsairDriver::new(),
             hwmon: hwmon::HwmonDriver::new(),
             nvidia: nvidia::NvidiaDriver::new(),
+            wireview: wireview::WireViewDriver::new(),
         }
     }
 
@@ -144,6 +166,10 @@ impl Hardware for SystemHardware {
             Ok(mut devices) => discovered.append(&mut devices),
             Err(error) => driver_errors.push(error.to_string()),
         }
+        match self.wireview.discover_configured(&config.devices) {
+            Ok(mut devices) => discovered.append(&mut devices),
+            Err(error) => driver_errors.push(error.to_string()),
+        }
         self.hwmon.validate_sensors(&config.sensors)?;
 
         let mut claimed = BTreeMap::new();
@@ -167,7 +193,9 @@ impl Hardware for SystemHardware {
                 driver_errors.push(format!("configured device '{alias}' was not found"));
             }
             match device {
-                DeviceConfig::CorsairIcueLink { .. } | DeviceConfig::NvidiaNvml { .. } => {}
+                DeviceConfig::CorsairIcueLink { .. }
+                | DeviceConfig::NvidiaNvml { .. }
+                | DeviceConfig::WireViewProIi { .. } => {}
             }
         }
         if !driver_errors.is_empty() {
@@ -194,6 +222,10 @@ impl Hardware for SystemHardware {
         }
         match self.hwmon.discover() {
             Ok(hwmon) => devices.extend(hwmon),
+            Err(error) => errors.push(error),
+        }
+        match self.wireview.discover_all() {
+            Ok(mut wireviews) => devices.append(&mut wireviews),
             Err(error) => errors.push(error),
         }
         if devices.is_empty() && !errors.is_empty() {
@@ -231,7 +263,7 @@ impl Hardware for SystemHardware {
             OutputConfig::Fan {
                 device, channels, ..
             } => (device.as_str(), channels.as_slice()),
-            OutputConfig::Rgb { .. } => {
+            OutputConfig::Rgb { .. } | OutputConfig::Display { .. } => {
                 return Err(FeatherError::Driver(format!(
                     "output '{alias}' is not a fan"
                 )));
@@ -252,13 +284,16 @@ impl Hardware for SystemHardware {
                 .nvidia
                 .set_fans(device_alias, &device_config, channels, percent)
                 .map(FanWrite::healthy),
+            DeviceConfig::WireViewProIi { .. } => Err(FeatherError::Driver(
+                "WireView devices do not expose system fan control".into(),
+            )),
         }
     }
 
     fn set_rgb(&mut self, alias: &str, config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {
         let (device_alias, led_count) = match config {
             OutputConfig::Rgb { device, led_count } => (device.as_str(), *led_count),
-            OutputConfig::Fan { .. } => {
+            OutputConfig::Fan { .. } | OutputConfig::Display { .. } => {
                 return Err(FeatherError::Driver(format!("output '{alias}' is not RGB")));
             }
         };
@@ -271,12 +306,43 @@ impl Hardware for SystemHardware {
             DeviceConfig::NvidiaNvml { .. } => Err(FeatherError::Driver(
                 "NVIDIA devices do not expose RGB control".into(),
             )),
+            DeviceConfig::WireViewProIi { .. } => Err(FeatherError::Driver(
+                "WireView devices do not expose RGB control".into(),
+            )),
+        }
+    }
+
+    fn set_display(
+        &mut self,
+        alias: &str,
+        config: &OutputConfig,
+        target: DisplayTarget,
+    ) -> Result<Value> {
+        let device_alias = match config {
+            OutputConfig::Display { device, .. } => device.as_str(),
+            OutputConfig::Fan { .. } | OutputConfig::Rgb { .. } => {
+                return Err(FeatherError::Driver(format!(
+                    "output '{alias}' is not a display"
+                )));
+            }
+        };
+        let device_config = self.device(device_alias)?.clone();
+        match &device_config {
+            DeviceConfig::WireViewProIi { .. } => {
+                self.wireview
+                    .set_display(device_alias, &device_config, target)
+            }
+            DeviceConfig::CorsairIcueLink { .. } | DeviceConfig::NvidiaNvml { .. } => Err(
+                FeatherError::Driver(format!("device '{device_alias}' has no display output")),
+            ),
         }
     }
 
     fn release(&mut self, alias: &str, config: &OutputConfig) -> Result<()> {
         let device_alias = match config {
-            OutputConfig::Fan { device, .. } | OutputConfig::Rgb { device, .. } => device,
+            OutputConfig::Fan { device, .. }
+            | OutputConfig::Rgb { device, .. }
+            | OutputConfig::Display { device, .. } => device,
         };
         let device_config = self.device(device_alias)?.clone();
         match &device_config {
@@ -284,6 +350,25 @@ impl Hardware for SystemHardware {
                 self.corsair.release(device_alias, &device_config)
             }
             DeviceConfig::NvidiaNvml { .. } => self.nvidia.release(alias, &device_config),
+            DeviceConfig::WireViewProIi { .. } => {
+                let OutputConfig::Display {
+                    brightness_percent, ..
+                } = config
+                else {
+                    return Err(FeatherError::Driver(format!(
+                        "device '{device_alias}' has an incompatible output"
+                    )));
+                };
+                self.wireview
+                    .set_display(
+                        alias,
+                        &device_config,
+                        DisplayTarget::Awake {
+                            brightness_percent: *brightness_percent,
+                        },
+                    )
+                    .map(|_| ())
+            }
         }
     }
 
@@ -294,6 +379,9 @@ impl Hardware for SystemHardware {
                 self.corsair.debug_dump(device_alias, &device_config)
             }
             DeviceConfig::NvidiaNvml { .. } => Err(FeatherError::Driver(format!(
+                "device '{device_alias}' is not a HID device"
+            ))),
+            DeviceConfig::WireViewProIi { .. } => Err(FeatherError::Driver(format!(
                 "device '{device_alias}' is not a HID device"
             ))),
         }
@@ -343,6 +431,15 @@ impl Hardware for SystemHardware {
     }
 
     fn set_rgb(&mut self, _alias: &str, _config: &OutputConfig, _rgb: [u8; 3]) -> Result<Value> {
+        Err(FeatherError::Driver("Linux host required".into()))
+    }
+
+    fn set_display(
+        &mut self,
+        _alias: &str,
+        _config: &OutputConfig,
+        _target: DisplayTarget,
+    ) -> Result<Value> {
         Err(FeatherError::Driver("Linux host required".into()))
     }
 

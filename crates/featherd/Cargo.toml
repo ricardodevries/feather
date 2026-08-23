@@ -27,3 +27,4 @@ tracing-subscriber.workspace = true
 hidapi.workspace = true
 nvml-wrapper.workspace = true
 sd-notify.workspace = true
+serialport.workspace = true

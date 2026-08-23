@@ -24,6 +24,14 @@ uuid = "GPU-REPLACE_WITH_FIRST_UUID"
 driver = "nvidia-nvml"
 uuid = "GPU-REPLACE_WITH_SECOND_UUID"
 
+[devices.wireview0]
+driver = "wire-view-pro-ii"
+serial = "REPLACE_WITH_FIRST_WIREVIEW_SERIAL"
+
+[devices.wireview1]
+driver = "wire-view-pro-ii"
+serial = "REPLACE_WITH_SECOND_WIREVIEW_SERIAL"
+
 [sensors.cpu]
 driver = "linux-hwmon"
 device = "0000:00:18.3"
@@ -106,6 +114,16 @@ kind = "rgb"
 device = "hub"
 led_count = 22
 
+[outputs.wireview0_display]
+kind = "display"
+device = "wireview0"
+brightness_percent = 100
+
+[outputs.wireview1_display]
+kind = "display"
+device = "wireview1"
+brightness_percent = 100
+
 [profiles.quiet.outputs.case_fans]
 sources = ["cpu", "gpu0", "gpu1"]
 aggregate = "max"
@@ -125,6 +143,14 @@ curve = "quiet"
 sources = ["cpu", "gpu0", "gpu1"]
 aggregate = "max"
 color_curve = "temperature"
+off_schedule = "night"
+
+[profiles.quiet.outputs.wireview0_display]
+sources = []
+off_schedule = "night"
+
+[profiles.quiet.outputs.wireview1_display]
+sources = []
 off_schedule = "night"
 
 [profiles.balanced.outputs.case_fans]
@@ -148,6 +174,14 @@ aggregate = "max"
 color_curve = "temperature"
 off_schedule = "night"
 
+[profiles.balanced.outputs.wireview0_display]
+sources = []
+off_schedule = "night"
+
+[profiles.balanced.outputs.wireview1_display]
+sources = []
+off_schedule = "night"
+
 [profiles.performance.outputs.case_fans]
 sources = ["cpu", "gpu0", "gpu1"]
 aggregate = "max"
@@ -167,4 +201,12 @@ curve = "performance"
 sources = ["cpu", "gpu0", "gpu1"]
 aggregate = "max"
 color_curve = "temperature"
+off_schedule = "night"
+
+[profiles.performance.outputs.wireview0_display]
+sources = []
+off_schedule = "night"
+
+[profiles.performance.outputs.wireview1_display]
+sources = []
 off_schedule = "night"

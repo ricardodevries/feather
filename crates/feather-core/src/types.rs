@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current local IPC protocol version.
-pub const IPC_PROTOCOL_VERSION: u32 = 2;
+pub const IPC_PROTOCOL_VERSION: u32 = 3;
 /// Current JSON status document version.
-pub const STATUS_SCHEMA_VERSION: u32 = 1;
+pub const STATUS_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -72,13 +72,15 @@ pub enum OutputKind {
     Fan,
     /// RGB LED output.
     Rgb,
+    /// Display power-state and brightness output.
+    Display,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 /// Runtime state for a configured output.
 pub struct OutputStatus {
-    /// Fan or RGB output type.
+    /// Fan, RGB, or display output type.
     pub kind: OutputKind,
     /// Current output health.
     pub health: Health,
@@ -98,6 +100,8 @@ pub enum OverrideKind {
     Fan,
     /// RGB color override.
     Rgb,
+    /// Display on/off override.
+    Display,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -108,7 +112,7 @@ pub struct OverrideStatus {
     pub output: String,
     /// Fan or RGB override type.
     pub kind: OverrideKind,
-    /// Requested percentage or RGB value.
+    /// Requested fan percentage, RGB value, or display state.
     pub value: serde_json::Value,
     /// Milliseconds until the override expires.
     pub remaining_ms: u64,

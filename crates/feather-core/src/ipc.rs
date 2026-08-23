@@ -78,6 +78,15 @@ pub enum Command {
         /// Override lifetime in milliseconds.
         duration_ms: u64,
     },
+    /// Temporarily turn a display on or off.
+    OverrideDisplay {
+        /// Output alias to override.
+        output: String,
+        /// `true` restores configured brightness; `false` sets brightness to zero.
+        enabled: bool,
+        /// Override lifetime in milliseconds.
+        duration_ms: u64,
+    },
     /// Clear temporary overrides.
     OverrideClear {
         /// Output alias, or all outputs when omitted.
@@ -300,6 +309,33 @@ mod tests {
                     "percent": 55,
                     "duration_ms": 10_000,
                     "allow_below_minimum": false
+                }
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn display_override_wire_format_is_stable() -> anyhow::Result<()> {
+        let request = Request {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            request_id: "test-display".into(),
+            command: Command::OverrideDisplay {
+                output: "gpu0_display".into(),
+                enabled: false,
+                duration_ms: 60_000,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(request)?,
+            json!({
+                "protocol_version": IPC_PROTOCOL_VERSION,
+                "request_id": "test-display",
+                "command": "override-display",
+                "args": {
+                    "output": "gpu0_display",
+                    "enabled": false,
+                    "duration_ms": 60_000
                 }
             })
         );

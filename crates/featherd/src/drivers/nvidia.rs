@@ -207,9 +207,9 @@ impl Drop for NvidiaDriver {
 fn uuid(config: &DeviceConfig) -> Result<&str> {
     match config {
         DeviceConfig::NvidiaNvml { uuid } => Ok(uuid),
-        DeviceConfig::CorsairIcueLink { .. } => Err(FeatherError::Driver(
-            "configured device is not an NVIDIA GPU".into(),
-        )),
+        DeviceConfig::CorsairIcueLink { .. } | DeviceConfig::WireViewProIi { .. } => Err(
+            FeatherError::Driver("configured device is not an NVIDIA GPU".into()),
+        ),
     }
 }
 
