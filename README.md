@@ -123,7 +123,7 @@ Copy the complete artifact directory and the host configuration to the Linux ser
 sudo ./install-server.sh . ./config.toml "$USER"
 ```
 
-The installer checks every file listed in `SHA256SUMS` and validates the config before stopping the current service. It backs up the installed files and restores them, the previous enablement state, and the previous running service if the update fails. On success, it installs `feather`, `featherd`, `feather-uninstall`, and the systemd, tmpfiles, sysusers, and udev files. It also adds the named operator to the local socket group. Start a new login session before running `feather` without sudo.
+The installer checks every file listed in `SHA256SUMS` and validates the config before stopping the current service. It backs up the installed files and restores them, the previous enablement state, and the previous running service if the update fails. On success, it installs `feather`, `featherd`, `feather-uninstall`, and the systemd, tmpfiles, sysusers, and udev files. It also adds the named operator to the local socket group. The service receives `CAP_SYS_ADMIN` because NVML requires administrator permission for GPU fan writes. Start a new login session before running `feather` without sudo.
 
 Inspect the service with:
 
