@@ -3,11 +3,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor};
+use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor, error::NvmlError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -19,6 +21,7 @@ use feather_core::{
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_REPLY_GRACE: Duration = Duration::from_secs(1);
+const HELPER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_SHUTDOWN_REQUEST_TIMEOUT: Duration = DEFAULT_REQUEST_TIMEOUT;
 const NVIDIA_HELPER_ARGUMENT: &str = "--nvidia-helper";
 
@@ -26,6 +29,7 @@ const NVIDIA_HELPER_ARGUMENT: &str = "--nvidia-helper";
 /// a wedged NVML ioctl for one device cannot block the other drivers or GPUs.
 pub(super) struct NvidiaDriver {
     timeout: Duration,
+    heartbeat: Option<Arc<AtomicU64>>,
     helpers: BTreeMap<String, HelperClient>,
 }
 
@@ -33,12 +37,17 @@ impl NvidiaDriver {
     pub(super) fn new() -> Self {
         Self {
             timeout: DEFAULT_REQUEST_TIMEOUT,
+            heartbeat: None,
             helpers: BTreeMap::new(),
         }
     }
 
     pub(super) fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
+    }
+
+    pub(super) fn set_heartbeat(&mut self, heartbeat: Arc<AtomicU64>) {
+        self.heartbeat = Some(heartbeat);
     }
 
     pub(super) fn retain_configured(&mut self, configured: &BTreeMap<String, DeviceConfig>) {
@@ -93,7 +102,7 @@ impl NvidiaDriver {
     }
 
     fn discover_all_with_timeout(&mut self, timeout: Duration) -> Result<Vec<DeviceDescriptor>> {
-        let mut helper = HelperClient::spawn("discovery")?;
+        let mut helper = HelperClient::spawn("discovery", self.heartbeat.clone())?;
         let response = helper.call(HelperRequest::DiscoverAll, timeout);
         helper.shutdown(timeout);
         match response? {
@@ -161,8 +170,10 @@ impl NvidiaDriver {
 
     fn request_for(&mut self, uuid: &str, request: HelperRequest) -> Result<HelperResult> {
         if !self.helpers.contains_key(uuid) {
-            self.helpers
-                .insert(uuid.to_owned(), HelperClient::spawn(uuid)?);
+            self.helpers.insert(
+                uuid.to_owned(),
+                HelperClient::spawn(uuid, self.heartbeat.clone())?,
+            );
         }
         self.helpers
             .get_mut(uuid)
@@ -195,19 +206,14 @@ impl Drop for NvidiaDriver {
 
 struct HelperClient {
     label: String,
+    heartbeat: Option<Arc<AtomicU64>>,
     sender: Option<SyncSender<ManagerRequest>>,
     quarantined: Option<String>,
 }
 
 impl HelperClient {
-    fn spawn(label: &str) -> Result<Self> {
-        let executable = std::env::current_exe().map_err(|error| {
-            nvidia_error(
-                "could not resolve the featherd executable for an NVIDIA helper",
-                error,
-            )
-        })?;
-        let child = Command::new(executable)
+    fn spawn(label: &str, heartbeat: Option<Arc<AtomicU64>>) -> Result<Self> {
+        let child = Command::new("/proc/self/exe")
             .arg(NVIDIA_HELPER_ARGUMENT)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -216,10 +222,10 @@ impl HelperClient {
             .map_err(|error| {
                 nvidia_error(format!("could not start NVIDIA helper for {label}"), error)
             })?;
-        Self::supervise(label, child)
+        Self::supervise(label, child, heartbeat)
     }
 
-    fn supervise(label: &str, mut child: Child) -> Result<Self> {
+    fn supervise(label: &str, mut child: Child, heartbeat: Option<Arc<AtomicU64>>) -> Result<Self> {
         let stdin = child.stdin.take().ok_or_else(|| {
             FeatherError::Driver(format!("NVIDIA helper for {label} has no standard input"))
         })?;
@@ -239,6 +245,7 @@ impl HelperClient {
             })?;
         Ok(Self {
             label: label.to_owned(),
+            heartbeat,
             sender: Some(sender),
             quarantined: None,
         })
@@ -264,7 +271,7 @@ impl HelperClient {
             return self.quarantine("supervisor stopped before accepting the request".into());
         }
         let wait = timeout.saturating_add(HELPER_REPLY_GRACE);
-        let result = match response.recv_timeout(wait) {
+        let result = match self.receive_with_heartbeat(&response, wait) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 return self.quarantine(format!("request exceeded {timeout:?}"));
@@ -278,11 +285,38 @@ impl HelperClient {
         }
         match result {
             Ok(HelperResponse::Success { result }) => Ok(result),
-            Ok(HelperResponse::Error { message }) if terminal_nvidia_error(&message) => {
-                self.quarantine(message)
-            }
-            Ok(HelperResponse::Error { message }) => Err(FeatherError::Driver(message)),
+            Ok(HelperResponse::Error {
+                message,
+                terminal: true,
+            }) => self.quarantine(message),
+            Ok(HelperResponse::Error {
+                message,
+                terminal: false,
+            }) => Err(FeatherError::Driver(message)),
             Err(message) => self.quarantine(message),
+        }
+    }
+
+    fn receive_with_heartbeat(
+        &self,
+        response: &Receiver<std::result::Result<HelperResponse, String>>,
+        wait: Duration,
+    ) -> std::result::Result<std::result::Result<HelperResponse, String>, mpsc::RecvTimeoutError>
+    {
+        let started = Instant::now();
+        loop {
+            let remaining = wait.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            }
+            match response.recv_timeout(remaining.min(HELPER_HEARTBEAT_INTERVAL)) {
+                Err(mpsc::RecvTimeoutError::Timeout) if started.elapsed() < wait => {
+                    if let Some(heartbeat) = &self.heartbeat {
+                        heartbeat.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                result => return result,
+            }
         }
     }
 
@@ -427,7 +461,7 @@ enum HelperRequest {
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum HelperResponse {
     Success { result: HelperResult },
-    Error { message: String },
+    Error { message: String, terminal: bool },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -453,6 +487,7 @@ pub(crate) fn run_helper() -> Result<()> {
                     &mut stdout,
                     &HelperResponse::Error {
                         message: format!("invalid NVIDIA helper request: {error}"),
+                        terminal: false,
                     },
                 )?;
                 continue;
@@ -465,7 +500,8 @@ pub(crate) fn run_helper() -> Result<()> {
         let response = match execute_helper_request(&mut driver, request) {
             Ok(result) => HelperResponse::Success { result },
             Err(error) => HelperResponse::Error {
-                message: error.to_string(),
+                message: error.message,
+                terminal: error.terminal,
             },
         };
         write_helper_response(&mut stdout, &response)?;
@@ -479,7 +515,7 @@ pub(crate) fn run_helper() -> Result<()> {
 fn execute_helper_request(
     driver: &mut LocalNvidiaDriver,
     request: HelperRequest,
-) -> Result<HelperResult> {
+) -> LocalResult<HelperResult> {
     match request {
         HelperRequest::DiscoverAll => driver.discover_all().map(HelperResult::Devices),
         HelperRequest::ReadTemperature { alias, uuid } => driver
@@ -518,6 +554,36 @@ struct FanCapabilities {
     maximum: u32,
 }
 
+#[derive(Debug)]
+struct LocalError {
+    message: String,
+    terminal: bool,
+}
+
+impl LocalError {
+    fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            terminal: false,
+        }
+    }
+
+    fn nvml(context: impl AsRef<str>, error: NvmlError) -> Self {
+        Self {
+            message: format!("{}: {error}", context.as_ref()),
+            terminal: matches!(error, NvmlError::GpuLost | NvmlError::ResetRequired),
+        }
+    }
+}
+
+impl std::fmt::Display for LocalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+type LocalResult<T> = std::result::Result<T, LocalError>;
+
 /// Helper-side NVML owner. It never shares a process with the main daemon's
 /// Corsair, hwmon, or WireView control paths.
 struct LocalNvidiaDriver {
@@ -535,19 +601,19 @@ impl LocalNvidiaDriver {
         }
     }
 
-    fn discover_all(&mut self) -> Result<Vec<DeviceDescriptor>> {
+    fn discover_all(&mut self) -> LocalResult<Vec<DeviceDescriptor>> {
         let nvml = self.nvml()?;
         let count = nvml
             .device_count()
-            .map_err(|error| nvidia_error("could not count GPUs", error))?;
+            .map_err(|error| LocalError::nvml("could not count GPUs", error))?;
         let mut found = Vec::new();
         for index in 0..count {
             let device = nvml
                 .device_by_index(index)
-                .map_err(|error| nvidia_error(format!("could not open GPU {index}"), error))?;
-            let uuid = device
-                .uuid()
-                .map_err(|error| nvidia_error(format!("could not read GPU {index} UUID"), error))?;
+                .map_err(|error| LocalError::nvml(format!("could not open GPU {index}"), error))?;
+            let uuid = device.uuid().map_err(|error| {
+                LocalError::nvml(format!("could not read GPU {index} UUID"), error)
+            })?;
             let name = device
                 .name()
                 .unwrap_or_else(|_| format!("NVIDIA GPU {index}"));
@@ -580,15 +646,17 @@ impl LocalNvidiaDriver {
         Ok(found)
     }
 
-    fn read_temperature(&mut self, alias: &str, uuid: &str) -> Result<f64> {
+    fn read_temperature(&mut self, alias: &str, uuid: &str) -> LocalResult<f64> {
         let device = self
             .nvml()?
             .device_by_uuid(uuid)
-            .map_err(|error| nvidia_error(format!("device '{alias}' is unavailable"), error))?;
+            .map_err(|error| LocalError::nvml(format!("device '{alias}' is unavailable"), error))?;
         device
             .temperature(TemperatureSensor::Gpu)
             .map(f64::from)
-            .map_err(|error| nvidia_error(format!("could not read '{alias}' temperature"), error))
+            .map_err(|error| {
+                LocalError::nvml(format!("could not read '{alias}' temperature"), error)
+            })
     }
 
     fn set_fans(
@@ -597,18 +665,19 @@ impl LocalNvidiaDriver {
         uuid: &str,
         channels: &[u32],
         percent: u8,
-    ) -> Result<Value> {
+    ) -> LocalResult<Value> {
         self.controlled.insert(uuid.to_owned());
         let capabilities = self.fan_capabilities(alias, uuid)?;
-        let targets = selected_channels(channels, capabilities.count, alias)?;
+        let targets = selected_channels(channels, capabilities.count, alias)
+            .map_err(|error| LocalError::message(error.to_string()))?;
         let target = u32::from(percent).clamp(capabilities.minimum, capabilities.maximum);
         let mut device = self
             .nvml()?
             .device_by_uuid(uuid)
-            .map_err(|error| nvidia_error(format!("device '{alias}' is unavailable"), error))?;
+            .map_err(|error| LocalError::nvml(format!("device '{alias}' is unavailable"), error))?;
         for fan in &targets {
             device.set_fan_speed(*fan, target).map_err(|error| {
-                nvidia_error(format!("could not set '{alias}' fan {fan}"), error)
+                LocalError::nvml(format!("could not set '{alias}' fan {fan}"), error)
             })?;
         }
         let speeds = targets
@@ -622,26 +691,32 @@ impl LocalNvidiaDriver {
         }))
     }
 
-    fn release(&mut self, alias: &str, uuid: &str) -> Result<()> {
+    fn release(&mut self, alias: &str, uuid: &str) -> LocalResult<()> {
         let capabilities = self.fan_capabilities(alias, uuid)?;
         let mut device = self
             .nvml()?
             .device_by_uuid(uuid)
-            .map_err(|error| nvidia_error(format!("device '{alias}' is unavailable"), error))?;
+            .map_err(|error| LocalError::nvml(format!("device '{alias}' is unavailable"), error))?;
         let mut failures = Vec::new();
         for fan in 0..capabilities.count {
             if let Err(error) = device.set_default_fan_speed(fan) {
-                failures.push(format!("fan {fan}: {error}"));
+                failures.push(LocalError::nvml(format!("fan {fan}"), error));
             }
         }
         if failures.is_empty() {
             self.controlled.remove(uuid);
             Ok(())
         } else {
-            Err(FeatherError::Driver(format!(
-                "could not restore '{alias}' automatic fan policy: {}",
-                failures.join(", ")
-            )))
+            let terminal = failures.iter().any(|error| error.terminal);
+            let failures = failures
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(LocalError {
+                message: format!("could not restore '{alias}' automatic fan policy: {failures}"),
+                terminal,
+            })
         }
     }
 
@@ -656,17 +731,17 @@ impl LocalNvidiaDriver {
         self.nvml = None;
     }
 
-    fn fan_capabilities(&mut self, alias: &str, uuid: &str) -> Result<FanCapabilities> {
+    fn fan_capabilities(&mut self, alias: &str, uuid: &str) -> LocalResult<FanCapabilities> {
         if let Some(capabilities) = self.fan_capabilities.get(uuid) {
             return Ok(capabilities.clone());
         }
         let device = self
             .nvml()?
             .device_by_uuid(uuid)
-            .map_err(|error| nvidia_error(format!("device '{alias}' is unavailable"), error))?;
-        let count = device
-            .num_fans()
-            .map_err(|error| nvidia_error(format!("could not count fans for '{alias}'"), error))?;
+            .map_err(|error| LocalError::nvml(format!("device '{alias}' is unavailable"), error))?;
+        let count = device.num_fans().map_err(|error| {
+            LocalError::nvml(format!("could not count fans for '{alias}'"), error)
+        })?;
         let (minimum, maximum) = device.min_max_fan_speed().unwrap_or((0, 100));
         let capabilities = FanCapabilities {
             count,
@@ -678,14 +753,14 @@ impl LocalNvidiaDriver {
         Ok(capabilities)
     }
 
-    fn nvml(&mut self) -> Result<&Nvml> {
+    fn nvml(&mut self) -> LocalResult<&Nvml> {
         if self.nvml.is_none() {
             self.nvml = Some(Nvml::init().map_err(|error| {
-                nvidia_error("could not load or initialize libnvidia-ml.so.1", error)
+                LocalError::nvml("could not load or initialize libnvidia-ml.so.1", error)
             })?);
         }
         self.nvml.as_ref().ok_or_else(|| {
-            FeatherError::Driver("NVML initialization completed without a library handle".into())
+            LocalError::message("NVML initialization completed without a library handle")
         })
     }
 }
@@ -730,20 +805,6 @@ fn unexpected_response(operation: &str, response: &HelperResult) -> FeatherError
     ))
 }
 
-fn terminal_nvidia_error(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    [
-        "requires a reset",
-        "reset required",
-        "gpu is lost",
-        "gpu has fallen off",
-        "fallen off the bus",
-        "fell off the bus",
-    ]
-    .iter()
-    .any(|needle| message.contains(needle))
-}
-
 fn quarantined_error(label: &str, reason: &str) -> FeatherError {
     FeatherError::Driver(format!(
         "NVIDIA helper for {label} is quarantined: {reason}; reset the GPU and restart featherd"
@@ -759,18 +820,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identifies_terminal_driver_errors() {
-        assert!(terminal_nvidia_error(
-            "device requires a reset before it can be used again"
-        ));
-        assert!(terminal_nvidia_error(
-            "Reset required [NV_ERR_RESET_REQUIRED]"
-        ));
-        assert!(terminal_nvidia_error("GPU has fallen off the bus"));
-        assert!(terminal_nvidia_error(
-            "device fell off the bus or has otherwise become inaccessible"
-        ));
-        assert!(!terminal_nvidia_error("temporarily unavailable"));
+    fn classifies_terminal_driver_errors_structurally() {
+        assert!(LocalError::nvml("read failed", NvmlError::ResetRequired).terminal);
+        assert!(LocalError::nvml("read failed", NvmlError::GpuLost).terminal);
+        assert!(!LocalError::nvml("alias says reset required", NvmlError::Timeout).terminal);
     }
 
     #[test]
@@ -794,14 +847,17 @@ mod tests {
     fn a_timed_out_helper_is_killed_quarantined_and_isolated() -> anyhow::Result<()> {
         let stalled_child = test_helper("exec sleep 60")?;
         let stalled_pid = stalled_child.id();
-        let mut stalled = HelperClient::supervise("stalled", stalled_child)?;
+        let heartbeat = Arc::new(AtomicU64::new(0));
+        let mut stalled =
+            HelperClient::supervise("stalled", stalled_child, Some(Arc::clone(&heartbeat)))?;
         let mut responsive = HelperClient::supervise(
             "responsive",
             test_helper(
                 "while IFS= read -r line; do printf '%s\\n' '{\"status\":\"success\",\"result\":{\"type\":\"unit\"}}'; done",
             )?,
+            None,
         )?;
-        let timeout = Duration::from_millis(500);
+        let timeout = Duration::from_millis(1_200);
 
         thread::scope(|scope| -> anyhow::Result<()> {
             let stalled_call = scope.spawn(|| stalled.call(HelperRequest::DiscoverAll, timeout));
@@ -823,6 +879,7 @@ mod tests {
             assert!(error.to_string().contains("quarantined"));
             Ok(())
         })?;
+        assert!(heartbeat.load(Ordering::Relaxed) > 0);
 
         let retry_started = std::time::Instant::now();
         let Err(retry_error) = stalled.call(HelperRequest::DiscoverAll, timeout) else {

@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use serde_json::Value;
 
@@ -46,6 +48,9 @@ mod wireview;
 
 /// Hardware operations used by the policy engine.
 pub trait Hardware: Send + 'static {
+    /// Supplies a progress counter used to prove bounded driver waits remain alive.
+    fn set_heartbeat(&mut self, _heartbeat: Arc<AtomicU64>) {}
+
     /// Validates configured selectors and returns the selected devices.
     ///
     /// # Errors
@@ -163,6 +168,10 @@ impl Default for SystemHardware {
 
 #[cfg(target_os = "linux")]
 impl Hardware for SystemHardware {
+    fn set_heartbeat(&mut self, heartbeat: Arc<AtomicU64>) {
+        self.nvidia.set_heartbeat(heartbeat);
+    }
+
     fn preflight(&mut self, config: &Config) -> Result<Vec<DeviceDescriptor>> {
         let mut discovered = Vec::new();
         let mut driver_errors = Vec::new();
