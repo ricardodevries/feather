@@ -50,6 +50,21 @@ journalctl -u featherd.service -f
 
 `feather status --check` prints status and exits with code 5 when daemon health is degraded or in fail-safe mode. With `--json`, watch mode emits one compact JSON object per line.
 
+## Recover a quarantined NVIDIA GPU
+
+Feather does not reset GPUs automatically. When an NVIDIA helper times out or reports that its GPU requires a reset, the daemon remains available and continues controlling other hardware. The affected status entries include `NVIDIA helper ... is quarantined` and instruct the operator to reset the GPU and restart Feather.
+
+The affected GPU may remain at its last accepted manual fan target because a blocked driver cannot process Feather's automatic-policy cleanup request. Outputs using that GPU's temperature enter their configured fail-safe behavior once the reading is stale.
+
+Stop every workload and monitoring client using the affected GPU, then perform a function-level reset by UUID:
+
+```sh
+sudo nvidia-smi --gpu-reset -i GPU-REPLACE_WITH_UUID
+sudo systemctl restart featherd.service
+```
+
+`nvidia-smi` refuses the reset while clients are attached and reports when topology requires additional peer GPUs. A host reboot remains the fallback when a function-level reset cannot complete. Capture `sudo nvidia-bug-report.sh` before resetting or rebooting when the failure may need driver investigation.
+
 ## Test a fan output
 
 ```sh

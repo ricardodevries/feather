@@ -7,6 +7,7 @@ stale_after = "10s"
 socket = "/run/feather/feather.sock"
 state_file = "/var/lib/feather/state.json"
 failure_limit = 5
+driver_timeout = "5s"
 
 [devices.hub]
 driver = "corsair-icue-link"

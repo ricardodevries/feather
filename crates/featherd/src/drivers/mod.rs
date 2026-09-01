@@ -40,7 +40,7 @@ mod corsair;
 #[cfg(target_os = "linux")]
 mod hwmon;
 #[cfg(target_os = "linux")]
-mod nvidia;
+pub(crate) mod nvidia;
 #[cfg(target_os = "linux")]
 mod wireview;
 
@@ -77,6 +77,15 @@ pub trait Hardware: Send + 'static {
     ///
     /// Returns an error when the output is not a fan or its driver rejects the write.
     fn set_fan(&mut self, alias: &str, config: &OutputConfig, percent: u8) -> Result<FanWrite>;
+
+    /// Whether an unchanged fan target must be periodically written again.
+    ///
+    /// Stateful controllers may require refreshes. NVIDIA's manual fan policy
+    /// retains its target, so avoiding unchanged writes materially reduces
+    /// synchronous NVML traffic.
+    fn fan_needs_periodic_refresh(&self, _config: &OutputConfig) -> bool {
+        true
+    }
 
     /// Sets a configured RGB output and returns observed data.
     ///
@@ -155,6 +164,7 @@ impl Default for SystemHardware {
 #[cfg(target_os = "linux")]
 impl Hardware for SystemHardware {
     fn preflight(&mut self, config: &Config) -> Result<Vec<DeviceDescriptor>> {
+        self.nvidia.set_timeout(config.daemon.driver_timeout);
         let mut discovered = Vec::new();
         let mut driver_errors = Vec::new();
 
@@ -206,6 +216,7 @@ impl Hardware for SystemHardware {
     }
 
     fn commit_config(&mut self, config: &Config) {
+        self.nvidia.retain_configured(&config.devices);
         self.devices.clone_from(&config.devices);
     }
 
@@ -288,6 +299,16 @@ impl Hardware for SystemHardware {
                 "WireView devices do not expose system fan control".into(),
             )),
         }
+    }
+
+    fn fan_needs_periodic_refresh(&self, config: &OutputConfig) -> bool {
+        let OutputConfig::Fan { device, .. } = config else {
+            return false;
+        };
+        !matches!(
+            self.devices.get(device),
+            Some(DeviceConfig::NvidiaNvml { .. })
+        )
     }
 
     fn set_rgb(&mut self, alias: &str, config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {

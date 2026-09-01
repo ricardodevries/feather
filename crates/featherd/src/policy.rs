@@ -9,7 +9,7 @@ use chrono::{DateTime, Local, Timelike};
 use serde_json::{Value, json};
 
 use feather_core::{
-    config::{AssignmentConfig, Config, OutputConfig},
+    config::{AssignmentConfig, Config, DeviceConfig, OutputConfig},
     curve::{interpolate_color, interpolate_fan, schedule_active},
     error::{FeatherError, Result},
     types::{
@@ -149,7 +149,7 @@ impl Engine {
                 let runtime = self.outputs.entry(output_name.clone()).or_default();
                 runtime.health = Some(Health::Degraded);
                 runtime.error = Some(error.to_string());
-                runtime.consecutive_failures += 1;
+                runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
             }
             let current = self.outputs.get(&output_name).map(|runtime| {
                 (
@@ -162,10 +162,7 @@ impl Engine {
 
         self.outputs.iter().any(|(name, runtime)| {
             runtime.consecutive_failures >= self.config.daemon.failure_limit
-                && matches!(
-                    self.config.outputs.get(name),
-                    Some(OutputConfig::Fan { .. })
-                )
+                && self.fan_failure_stops_daemon(name)
         })
     }
 
@@ -398,11 +395,13 @@ impl Engine {
             OutputConfig::Rgb { .. } | OutputConfig::Display { .. } => Duration::ZERO,
         };
         let target = json!(percent);
+        let needs_periodic_refresh = self.hardware.fan_needs_periodic_refresh(config);
         let needs_write = self.outputs.get(output_name).is_none_or(|runtime| {
             runtime.last_target.as_ref() != Some(&target)
-                || runtime
-                    .last_write
-                    .is_none_or(|last| now.saturating_duration_since(last) >= refresh)
+                || needs_periodic_refresh
+                    && runtime
+                        .last_write
+                        .is_none_or(|last| now.saturating_duration_since(last) >= refresh)
         });
         if !needs_write {
             let runtime = self.outputs.entry(output_name.into()).or_default();
@@ -419,6 +418,16 @@ impl Engine {
         runtime.error = write.warning;
         runtime.consecutive_failures = 0;
         Ok(())
+    }
+
+    fn fan_failure_stops_daemon(&self, output_name: &str) -> bool {
+        let Some(OutputConfig::Fan { device, .. }) = self.config.outputs.get(output_name) else {
+            return false;
+        };
+        !matches!(
+            self.config.devices.get(device),
+            Some(DeviceConfig::NvidiaNvml { .. })
+        )
     }
 
     fn write_rgb(
@@ -1082,6 +1091,41 @@ sources = ["cpu"]
 curve = "main"
 "#;
 
+    const NVIDIA_OUTPUT_CONFIG: &str = r#"
+schema_version = 1
+default_profile = "balanced"
+
+[daemon]
+poll_interval = "1s"
+stale_after = "2s"
+failure_limit = 3
+
+[devices.gpu0]
+driver = "nvidia-nvml"
+uuid = "GPU-test"
+
+[sensors.cpu]
+driver = "linux-hwmon"
+device = "test-device"
+chip = "test-chip"
+label = "test-label"
+
+[curves.main]
+points = [{ temp = 40, percent = 40 }, { temp = 60, percent = 60 }]
+
+[outputs.gpu_fans]
+kind = "fan"
+device = "gpu0"
+channels = []
+minimum_percent = 30
+fail_safe_percent = 100
+refresh_interval = "1s"
+
+[profiles.balanced.outputs.gpu_fans]
+sources = ["cpu"]
+curve = "main"
+"#;
+
     const DISPLAY_CONFIG: &str = r#"
 schema_version = 1
 default_profile = "balanced"
@@ -1111,6 +1155,7 @@ off_schedule = "night"
         display_writes: Vec<(String, DisplayTarget)>,
         display_error: Option<String>,
         fan_warning: Option<String>,
+        fan_error: Option<String>,
         releases: Vec<String>,
         preflights: usize,
         commits: usize,
@@ -1148,11 +1193,18 @@ off_schedule = "night"
             percent: u8,
         ) -> Result<crate::drivers::FanWrite> {
             let mut state = lock_state(&self.state);
+            if let Some(error) = &state.fan_error {
+                return Err(FeatherError::Driver(error.clone()));
+            }
             state.fan_writes.push((alias.to_owned(), percent));
             Ok(crate::drivers::FanWrite {
                 observed: json!({ "percent": percent }),
                 warning: state.fan_warning.clone(),
             })
+        }
+
+        fn fan_needs_periodic_refresh(&self, config: &OutputConfig) -> bool {
+            !matches!(config, OutputConfig::Fan { device, .. } if device == "gpu0")
         }
 
         fn set_rgb(&mut self, _alias: &str, _config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {
@@ -1317,6 +1369,53 @@ off_schedule = "night"
         let status = engine.status(now + Duration::from_secs(10));
         assert_eq!(status.health, Health::Degraded);
         assert_eq!(status.outputs["gpu_display"].health, Health::Degraded);
+        Ok(())
+    }
+
+    #[test]
+    fn nvidia_fan_failures_degrade_without_stopping_other_control() -> anyhow::Result<()> {
+        let (mut engine, state) = test_engine(NVIDIA_OUTPUT_CONFIG, Some(50.0))?;
+        lock_state(&state).fan_error = Some("NVIDIA helper is quarantined".into());
+        let now = Instant::now();
+
+        for seconds in 0..10 {
+            assert!(!engine.tick(now + Duration::from_secs(seconds), Local::now()));
+        }
+
+        let status = engine.status(now + Duration::from_secs(10));
+        assert_eq!(status.health, Health::Degraded);
+        assert_eq!(status.outputs["gpu_fans"].health, Health::Degraded);
+        assert!(
+            status.outputs["gpu_fans"]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("quarantined"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nvidia_fan_targets_are_not_rewritten_when_unchanged() -> anyhow::Result<()> {
+        let (mut engine, state) = test_engine(NVIDIA_OUTPUT_CONFIG, Some(50.0))?;
+        let now = Instant::now();
+
+        for seconds in 0..10 {
+            assert!(!engine.tick(now + Duration::from_secs(seconds), Local::now()));
+        }
+
+        assert_eq!(lock_state(&state).fan_writes.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_corsair_fan_failures_remain_fatal() -> anyhow::Result<()> {
+        let (mut engine, state) = test_engine(ENGINE_CONFIG, Some(50.0))?;
+        lock_state(&state).fan_error = Some("fan controller unavailable".into());
+        let now = Instant::now();
+
+        assert!(!engine.tick(now, Local::now()));
+        assert!(!engine.tick(now + Duration::from_secs(1), Local::now()));
+        assert!(engine.tick(now + Duration::from_secs(2), Local::now()));
         Ok(())
     }
 

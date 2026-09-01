@@ -64,6 +64,9 @@ pub struct DaemonConfig {
     pub state_file: String,
     /// Consecutive output failures that stop the daemon.
     pub failure_limit: u32,
+    /// Maximum time allowed for an isolated hardware-driver request.
+    #[serde(with = "humantime_serde")]
+    pub driver_timeout: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -74,6 +77,7 @@ impl Default for DaemonConfig {
             socket: "/run/feather/feather.sock".into(),
             state_file: "/var/lib/feather/state.json".into(),
             failure_limit: 5,
+            driver_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -213,7 +217,8 @@ pub enum OutputConfig {
         /// Minimum target change before a new value is accepted.
         #[serde(default = "default_hysteresis")]
         hysteresis_percent: u8,
-        /// Maximum delay before the current target is written again.
+        /// Maximum delay before the current target is written again when the
+        /// hardware driver requires periodic refreshes.
         #[serde(default = "default_refresh", with = "humantime_serde")]
         refresh_interval: Duration,
     },
@@ -338,6 +343,11 @@ impl Config {
         if self.daemon.failure_limit == 0 {
             return Err(config_error(
                 "daemon.failure_limit must be greater than zero",
+            ));
+        }
+        if self.daemon.driver_timeout.is_zero() {
+            return Err(config_error(
+                "daemon.driver_timeout must be greater than zero",
             ));
         }
         if !self.profiles.contains_key(&self.default_profile) {
@@ -938,6 +948,23 @@ off_schedule = "night"
         };
         let error = error.to_string();
         assert!(error.contains("unknown field"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_zero_driver_timeout() -> anyhow::Result<()> {
+        let invalid = VALID.replace(
+            "default_profile = \"balanced\"",
+            "default_profile = \"balanced\"\n\n[daemon]\ndriver_timeout = \"0s\"",
+        );
+        let Err(error) = Config::from_toml(&invalid) else {
+            anyhow::bail!("zero driver timeout was accepted");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("daemon.driver_timeout must be greater than zero")
+        );
         Ok(())
     }
 

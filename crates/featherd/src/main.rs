@@ -35,11 +35,15 @@ struct Args {
     /// Increase log detail. Repeat for protocol-level logs.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// Run the private NVIDIA driver helper protocol.
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true)]
+    nvidia_helper: bool,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match try_main().await {
+fn main() -> ExitCode {
+    match try_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -48,9 +52,14 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn try_main() -> Result<()> {
+fn try_main() -> Result<()> {
     let args = Args::parse();
     init_tracing(args.verbose)?;
+    #[cfg(target_os = "linux")]
+    if args.nvidia_helper {
+        featherd::run_nvidia_helper()?;
+        return Ok(());
+    }
     if args.discover {
         let devices = featherd::discover_devices()?;
         if args.json {
@@ -65,8 +74,11 @@ async fn try_main() -> Result<()> {
         }
         return Ok(());
     }
-    featherd::run(args.config, args.socket)
-        .await
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not start the featherd async runtime")?
+        .block_on(featherd::run(args.config, args.socket))
         .context("featherd stopped with an error")
 }
 

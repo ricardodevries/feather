@@ -76,6 +76,7 @@ Fan control can damage hardware when configured incorrectly. Use conservative cu
 - Overrides always expire. Values below an output's minimum require explicit confirmation.
 - USB operations get one fresh-device retry. Continued fan failures still stop the daemon.
 - systemd applies a watchdog, restart limit, filesystem restrictions, and the capability required for NVIDIA fan writes.
+- Per-GPU NVIDIA helpers bound blocking NVML calls; a failed GPU is quarantined while other thermal control continues.
 
 ## Documentation
 
