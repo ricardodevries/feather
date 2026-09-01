@@ -17,8 +17,7 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// # Errors
 ///
-/// Returns an error when the helper cannot read a request, access NVML, or
-/// write a response.
+/// Returns an error when the helper cannot read a request or write a response.
 #[cfg(target_os = "linux")]
 pub fn run_nvidia_helper() -> feather_core::error::Result<()> {
     drivers::nvidia::run_helper()

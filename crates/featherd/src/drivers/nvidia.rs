@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,7 @@ use feather_core::{
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_REPLY_GRACE: Duration = Duration::from_secs(1);
 const HELPER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+const HELPER_STATUS_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_SHUTDOWN_REQUEST_TIMEOUT: Duration = DEFAULT_REQUEST_TIMEOUT;
 const NVIDIA_HELPER_ARGUMENT: &str = "--nvidia-helper";
 
@@ -170,8 +171,8 @@ impl NvidiaDriver {
         let Some(helper) = self.helpers.get(uuid) else {
             return Ok(());
         };
-        match &helper.quarantined {
-            Some(reason) => Err(quarantined_error(&helper.label, reason)),
+        match helper.failure_reason() {
+            Some(reason) => Err(quarantined_error(&helper.label, &reason)),
             None => Ok(()),
         }
     }
@@ -220,7 +221,7 @@ struct HelperClient {
     label: String,
     heartbeat: Option<Arc<AtomicU64>>,
     sender: Option<SyncSender<ManagerRequest>>,
-    quarantined: Option<String>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl HelperClient {
@@ -247,9 +248,20 @@ impl HelperClient {
         })?;
         let (sender, requests) = mpsc::sync_channel(8);
         let manager_label = label.to_owned();
+        let failure = Arc::new(Mutex::new(None));
+        let manager_failure = Arc::clone(&failure);
         thread::Builder::new()
             .name(format!("nvidia-{label}"))
-            .spawn(move || run_manager(manager_label, child, stdin, stdout, requests))
+            .spawn(move || {
+                run_manager(
+                    manager_label,
+                    child,
+                    stdin,
+                    stdout,
+                    requests,
+                    manager_failure,
+                );
+            })
             .map_err(|error| {
                 nvidia_error(
                     format!("could not supervise NVIDIA helper for {label}"),
@@ -260,13 +272,13 @@ impl HelperClient {
             label: label.to_owned(),
             heartbeat,
             sender: Some(sender),
-            quarantined: None,
+            failure,
         })
     }
 
     fn call(&mut self, request: HelperRequest, timeout: Duration) -> Result<HelperResult> {
-        if let Some(reason) = &self.quarantined {
-            return Err(quarantined_error(&self.label, reason));
+        if let Some(reason) = self.failure_reason() {
+            return self.quarantine(reason);
         }
         let shutdown = matches!(request, HelperRequest::Shutdown);
         let (reply, response) = mpsc::sync_channel(1);
@@ -334,7 +346,7 @@ impl HelperClient {
     }
 
     fn shutdown(&mut self, timeout: Duration) {
-        if self.quarantined.is_none() && self.sender.is_some() {
+        if self.failure_reason().is_none() && self.sender.is_some() {
             let _ = self.call(HelperRequest::Shutdown, timeout);
         }
     }
@@ -343,10 +355,30 @@ impl HelperClient {
         if let Some(sender) = self.sender.take() {
             let _ = sender.try_send(ManagerRequest::stop());
         }
-        tracing::error!(helper = self.label, %reason, "NVIDIA helper quarantined");
-        self.quarantined = Some(reason.clone());
+        let reason = record_helper_failure(&self.failure, &self.label, reason);
         Err(quarantined_error(&self.label, &reason))
     }
+
+    fn failure_reason(&self) -> Option<String> {
+        lock_helper_failure(&self.failure).clone()
+    }
+}
+
+fn lock_helper_failure(failure: &Mutex<Option<String>>) -> MutexGuard<'_, Option<String>> {
+    match failure.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn record_helper_failure(failure: &Mutex<Option<String>>, label: &str, reason: String) -> String {
+    let mut failure = lock_helper_failure(failure);
+    if let Some(reason) = &*failure {
+        return reason.clone();
+    }
+    tracing::error!(helper = label, %reason, "NVIDIA helper quarantined");
+    *failure = Some(reason.clone());
+    reason
 }
 
 fn isolate_process_group(command: &mut Command) {
@@ -376,6 +408,7 @@ fn run_manager(
     mut stdin: ChildStdin,
     stdout: impl std::io::Read + Send + 'static,
     requests: Receiver<ManagerRequest>,
+    failure: Arc<Mutex<Option<String>>>,
 ) {
     let (lines, responses) = mpsc::sync_channel(1);
     let reader_label = label.clone();
@@ -383,12 +416,66 @@ fn run_manager(
         .name(format!("nvidia-{label}-reader"))
         .spawn(move || read_helper_responses(reader_label, stdout, lines));
     if let Err(error) = reader {
-        tracing::error!(helper = label, %error, "could not start NVIDIA response reader");
+        record_helper_failure(
+            &failure,
+            &label,
+            format!("could not start NVIDIA response reader: {error}"),
+        );
         let _ = child.kill();
         return;
     }
 
-    while let Ok(message) = requests.recv() {
+    loop {
+        match responses.try_recv() {
+            Ok(Err(reason)) => {
+                record_helper_failure(&failure, &label, reason);
+                let _ = child.kill();
+                break;
+            }
+            Ok(Ok(response)) => {
+                record_helper_failure(
+                    &failure,
+                    &label,
+                    format!("helper produced an unsolicited response: {response:?}"),
+                );
+                let _ = child.kill();
+                break;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                record_helper_failure(
+                    &failure,
+                    &label,
+                    "response reader stopped unexpectedly".into(),
+                );
+                let _ = child.kill();
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let message = match requests.recv_timeout(HELPER_STATUS_INTERVAL) {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Timeout) => match child.try_wait() {
+                Ok(Some(status)) => {
+                    record_helper_failure(
+                        &failure,
+                        &label,
+                        format!("helper exited unexpectedly with {status}"),
+                    );
+                    break;
+                }
+                Ok(None) => continue,
+                Err(error) => {
+                    record_helper_failure(
+                        &failure,
+                        &label,
+                        format!("could not inspect helper process: {error}"),
+                    );
+                    let _ = child.kill();
+                    break;
+                }
+            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if matches!(message.request, HelperRequest::Stop) {
             let _ = child.kill();
             break;
@@ -407,6 +494,9 @@ fn run_manager(
             }
         });
         let transport_failed = result.is_err();
+        if let Err(reason) = &result {
+            record_helper_failure(&failure, &label, reason.clone());
+        }
         let _ = message.reply.send(result);
         if transport_failed {
             let _ = child.kill();
@@ -759,7 +849,7 @@ impl LocalNvidiaDriver {
         let count = device.num_fans().map_err(|error| {
             LocalError::nvml(format!("could not count fans for '{alias}'"), error)
         })?;
-        let (minimum, maximum) = device.min_max_fan_speed().unwrap_or((0, 100));
+        let (minimum, maximum) = fan_speed_range(alias, device.min_max_fan_speed())?;
         let capabilities = FanCapabilities {
             count,
             minimum,
@@ -779,6 +869,20 @@ impl LocalNvidiaDriver {
         self.nvml.as_ref().ok_or_else(|| {
             LocalError::message("NVML initialization completed without a library handle")
         })
+    }
+}
+
+fn fan_speed_range(
+    alias: &str,
+    range: std::result::Result<(u32, u32), NvmlError>,
+) -> LocalResult<(u32, u32)> {
+    match range {
+        Ok(range) => Ok(range),
+        Err(NvmlError::NotSupported) => Ok((0, 100)),
+        Err(error) => Err(LocalError::nvml(
+            format!("could not read fan speed range for '{alias}'"),
+            error,
+        )),
     }
 }
 
@@ -841,6 +945,22 @@ mod tests {
         assert!(LocalError::nvml("read failed", NvmlError::ResetRequired).terminal);
         assert!(LocalError::nvml("read failed", NvmlError::GpuLost).terminal);
         assert!(!LocalError::nvml("alias says reset required", NvmlError::Timeout).terminal);
+    }
+
+    #[test]
+    fn fan_speed_range_only_falls_back_when_unsupported() -> anyhow::Result<()> {
+        let unsupported = fan_speed_range("gpu0", Err(NvmlError::NotSupported))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        assert_eq!(
+            unsupported,
+            (0, 100),
+            "unsupported range query did not use the compatibility fallback"
+        );
+        let Err(reset) = fan_speed_range("gpu0", Err(NvmlError::ResetRequired)) else {
+            anyhow::bail!("reset-required range query unexpectedly succeeded");
+        };
+        assert!(reset.terminal);
+        Ok(())
     }
 
     #[test]
@@ -937,6 +1057,74 @@ mod tests {
         child.wait()?;
 
         assert_eq!(process_group, pid);
+        Ok(())
+    }
+
+    #[test]
+    fn an_idle_helper_crash_is_published_and_reaped() -> anyhow::Result<()> {
+        let child = test_helper(
+            "IFS= read -r line; printf '%s\\n' '{\"status\":\"success\",\"result\":{\"type\":\"unit\"}}'; kill -KILL $$",
+        )?;
+        let child_pid = child.id();
+        let mut helper = HelperClient::supervise("idle-crash", child, None)?;
+        let timeout = Duration::from_secs(1);
+
+        assert!(matches!(
+            helper.call(HelperRequest::DiscoverAll, timeout)?,
+            HelperResult::Unit
+        ));
+        let uuid = "GPU-idle-crash";
+        let config = DeviceConfig::NvidiaNvml { uuid: uuid.into() };
+        let mut driver = NvidiaDriver::new();
+        driver.helpers.insert(uuid.into(), helper);
+        for _ in 0..100 {
+            if driver.check_health(&config).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let Err(health) = driver.check_health(&config) else {
+            anyhow::bail!("idle helper crash was not published to driver health");
+        };
+        assert!(health.to_string().contains("quarantined"));
+        let retry_started = Instant::now();
+        let Err(retry) = driver.request_for(uuid, HelperRequest::DiscoverAll) else {
+            anyhow::bail!("crashed helper accepted another request");
+        };
+        assert!(retry.to_string().contains("quarantined"));
+        assert!(retry_started.elapsed() < Duration::from_millis(100));
+        assert!(!std::path::Path::new(&format!("/proc/{child_pid}")).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn an_idle_response_reader_failure_is_published_and_killed() -> anyhow::Result<()> {
+        let child = test_helper(
+            "IFS= read -r line; printf '%s\\n' '{\"status\":\"success\",\"result\":{\"type\":\"unit\"}}'; exec 1>&-; exec sleep 60",
+        )?;
+        let child_pid = child.id();
+        let mut helper = HelperClient::supervise("closed-output", child, None)?;
+        let timeout = Duration::from_secs(1);
+        assert!(matches!(
+            helper.call(HelperRequest::DiscoverAll, timeout)?,
+            HelperResult::Unit
+        ));
+
+        for _ in 0..100 {
+            if helper.failure_reason().is_some()
+                && !std::path::Path::new(&format!("/proc/{child_pid}")).exists()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let reason = helper
+            .failure_reason()
+            .ok_or_else(|| anyhow::anyhow!("response reader failure was not published"))?;
+        assert!(reason.contains("exited") || reason.contains("response reader"));
+        assert!(!std::path::Path::new(&format!("/proc/{child_pid}")).exists());
         Ok(())
     }
 
