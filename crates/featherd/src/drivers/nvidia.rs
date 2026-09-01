@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor, error::NvmlError};
+use nvml_wrapper::{Device, Nvml, enum_wrappers::device::TemperatureSensor, error::NvmlError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -78,23 +78,15 @@ impl NvidiaDriver {
         configured: &BTreeMap<String, DeviceConfig>,
         timeout: Duration,
     ) -> Result<Vec<DeviceDescriptor>> {
-        if !configured
-            .values()
-            .any(|config| matches!(config, DeviceConfig::NvidiaNvml { .. }))
-        {
-            return Ok(Vec::new());
-        }
-        let all = self.discover_all_with_timeout(timeout)?;
         let mut found = Vec::new();
         for (alias, config) in configured {
             let DeviceConfig::NvidiaNvml { uuid } = config else {
                 continue;
             };
-            if let Some(device) = all.iter().find(|device| device.id == *uuid) {
-                let mut device = device.clone();
-                device.details.insert("alias".into(), alias.clone());
-                found.push(device);
-            }
+            let helper = HelperClient::spawn(alias, self.heartbeat.clone())?;
+            found.push(discover_configured_with_helper(
+                alias, uuid, helper, timeout,
+            )?);
         }
         Ok(found)
     }
@@ -199,6 +191,49 @@ impl NvidiaDriver {
             .get_mut(uuid)
             .ok_or_else(|| FeatherError::Driver(format!("NVIDIA helper for {uuid} is missing")))?
             .call(request, self.timeout)
+    }
+}
+
+fn discover_configured_with_helper(
+    alias: &str,
+    uuid: &str,
+    mut helper: HelperClient,
+    timeout: Duration,
+) -> Result<DeviceDescriptor> {
+    let response = helper.call(
+        HelperRequest::DiscoverDevice {
+            alias: alias.into(),
+            uuid: uuid.into(),
+        },
+        timeout,
+    );
+    let quarantine_reason = helper.failure_reason();
+    helper.shutdown(timeout);
+    match response {
+        Ok(HelperResult::Device(mut device)) => {
+            device.details.insert("alias".into(), alias.into());
+            Ok(device)
+        }
+        Ok(other) => Err(unexpected_response("configured device discovery", &other)),
+        Err(error) if quarantine_reason.is_some() => {
+            let error = error.to_string();
+            tracing::warn!(device = alias, %error, "configured NVIDIA GPU is unavailable");
+            Ok(unavailable_device(alias, uuid, error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn unavailable_device(alias: &str, uuid: &str, error: String) -> DeviceDescriptor {
+    DeviceDescriptor {
+        id: uuid.into(),
+        driver: "nvidia-nvml".into(),
+        name: format!("NVIDIA GPU {alias} (unavailable)"),
+        details: BTreeMap::from([
+            ("alias".into(), alias.into()),
+            ("uuid".into(), uuid.into()),
+            ("unavailable".into(), error),
+        ]),
     }
 }
 
@@ -553,6 +588,10 @@ fn read_helper_responses(
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum HelperRequest {
     DiscoverAll,
+    DiscoverDevice {
+        alias: String,
+        uuid: String,
+    },
     ReadTemperature {
         alias: String,
         uuid: String,
@@ -582,6 +621,7 @@ enum HelperResponse {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 enum HelperResult {
     Devices(Vec<DeviceDescriptor>),
+    Device(DeviceDescriptor),
     Temperature(f64),
     Value(Value),
     Unit,
@@ -632,6 +672,9 @@ fn execute_helper_request(
 ) -> LocalResult<HelperResult> {
     match request {
         HelperRequest::DiscoverAll => driver.discover_all().map(HelperResult::Devices),
+        HelperRequest::DiscoverDevice { alias, uuid } => driver
+            .discover_device(&alias, &uuid)
+            .map(HelperResult::Device),
         HelperRequest::ReadTemperature { alias, uuid } => driver
             .read_temperature(&alias, &uuid)
             .map(HelperResult::Temperature),
@@ -685,9 +728,13 @@ impl LocalError {
     fn nvml(context: impl AsRef<str>, error: NvmlError) -> Self {
         Self {
             message: format!("{}: {error}", context.as_ref()),
-            terminal: matches!(error, NvmlError::GpuLost | NvmlError::ResetRequired),
+            terminal: terminal_nvml_error(&error),
         }
     }
+}
+
+fn terminal_nvml_error(error: &NvmlError) -> bool {
+    matches!(error, NvmlError::GpuLost | NvmlError::ResetRequired)
 }
 
 impl std::fmt::Display for LocalError {
@@ -728,36 +775,17 @@ impl LocalNvidiaDriver {
             let uuid = device.uuid().map_err(|error| {
                 LocalError::nvml(format!("could not read GPU {index} UUID"), error)
             })?;
-            let name = device
-                .name()
-                .unwrap_or_else(|_| format!("NVIDIA GPU {index}"));
-            let fan_count = device.num_fans().unwrap_or(0);
-            let mut details = BTreeMap::new();
-            details.insert("index".into(), index.to_string());
-            details.insert("uuid".into(), uuid.clone());
-            details.insert("fan_count".into(), fan_count.to_string());
-            if let Ok((minimum, maximum)) = device.min_max_fan_speed() {
-                details.insert("fan_range".into(), format!("{minimum}-{maximum}"));
-            }
-            if let Ok(temperature) = device.temperature(TemperatureSensor::Gpu) {
-                details.insert("temperature_c".into(), temperature.to_string());
-            }
-            for fan in 0..fan_count {
-                if let Ok(speed) = device.fan_speed(fan) {
-                    details.insert(format!("fan{fan}_percent"), speed.to_string());
-                }
-                if let Ok(policy) = device.fan_control_policy(fan) {
-                    details.insert(format!("fan{fan}_policy"), format!("{policy:?}"));
-                }
-            }
-            found.push(DeviceDescriptor {
-                id: uuid,
-                driver: "nvidia-nvml".into(),
-                name,
-                details,
-            });
+            found.push(describe_device(&device, uuid, Some(index))?);
         }
         Ok(found)
+    }
+
+    fn discover_device(&mut self, alias: &str, uuid: &str) -> LocalResult<DeviceDescriptor> {
+        let device = self
+            .nvml()?
+            .device_by_uuid(uuid)
+            .map_err(|error| LocalError::nvml(format!("device '{alias}' is unavailable"), error))?;
+        describe_device(&device, uuid.into(), None)
     }
 
     fn read_temperature(&mut self, alias: &str, uuid: &str) -> LocalResult<f64> {
@@ -879,6 +907,69 @@ impl LocalNvidiaDriver {
     }
 }
 
+fn describe_device(
+    device: &Device<'_>,
+    uuid: String,
+    index: Option<u32>,
+) -> LocalResult<DeviceDescriptor> {
+    let name = discovery_value("could not read GPU name", device.name())?.unwrap_or_else(|| {
+        index.map_or_else(
+            || format!("NVIDIA GPU {uuid}"),
+            |index| format!("NVIDIA GPU {index}"),
+        )
+    });
+    let fan_count = discovery_value("could not count GPU fans", device.num_fans())?.unwrap_or(0);
+    let mut details = BTreeMap::new();
+    if let Some(index) = index {
+        details.insert("index".into(), index.to_string());
+    }
+    details.insert("uuid".into(), uuid.clone());
+    details.insert("fan_count".into(), fan_count.to_string());
+    if let Some((minimum, maximum)) = discovery_value(
+        "could not read GPU fan speed range",
+        device.min_max_fan_speed(),
+    )? {
+        details.insert("fan_range".into(), format!("{minimum}-{maximum}"));
+    }
+    if let Some(temperature) = discovery_value(
+        "could not read GPU temperature",
+        device.temperature(TemperatureSensor::Gpu),
+    )? {
+        details.insert("temperature_c".into(), temperature.to_string());
+    }
+    for fan in 0..fan_count {
+        if let Some(speed) = discovery_value(
+            format!("could not read GPU fan {fan} speed"),
+            device.fan_speed(fan),
+        )? {
+            details.insert(format!("fan{fan}_percent"), speed.to_string());
+        }
+        if let Some(policy) = discovery_value(
+            format!("could not read GPU fan {fan} policy"),
+            device.fan_control_policy(fan),
+        )? {
+            details.insert(format!("fan{fan}_policy"), format!("{policy:?}"));
+        }
+    }
+    Ok(DeviceDescriptor {
+        id: uuid,
+        driver: "nvidia-nvml".into(),
+        name,
+        details,
+    })
+}
+
+fn discovery_value<T>(
+    context: impl AsRef<str>,
+    result: std::result::Result<T, NvmlError>,
+) -> LocalResult<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if terminal_nvml_error(&error) => Err(LocalError::nvml(context, error)),
+        Err(_) => Ok(None),
+    }
+}
+
 fn fan_speed_range(
     alias: &str,
     range: std::result::Result<(u32, u32), NvmlError>,
@@ -967,6 +1058,77 @@ mod tests {
             anyhow::bail!("reset-required range query unexpectedly succeeded");
         };
         assert!(reset.terminal);
+        Ok(())
+    }
+
+    #[test]
+    fn optional_discovery_fields_only_ignore_non_terminal_errors() -> anyhow::Result<()> {
+        assert!(
+            discovery_value::<u32>("optional", Err(NvmlError::NotSupported))
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?
+                .is_none()
+        );
+        let Err(reset) = discovery_value::<u32>("optional", Err(NvmlError::ResetRequired)) else {
+            anyhow::bail!("reset-required discovery field unexpectedly succeeded");
+        };
+        assert!(reset.terminal);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_configured_discovery_failure_is_isolated() -> anyhow::Result<()> {
+        let failed = HelperClient::supervise(
+            "failed-gpu",
+            test_helper(
+                "while IFS= read -r line; do printf '%s\\n' '{\"status\":\"error\",\"message\":\"GPU lost\",\"terminal\":true}'; done",
+            )?,
+            None,
+        )?;
+        let failed = discover_configured_with_helper(
+            "failed-gpu",
+            "GPU-failed",
+            failed,
+            Duration::from_secs(1),
+        )?;
+        assert_eq!(failed.id, "GPU-failed");
+        assert!(failed.details.contains_key("unavailable"));
+
+        let healthy = HelperClient::supervise(
+            "healthy-gpu",
+            test_helper(
+                "while IFS= read -r line; do printf '%s\\n' '{\"status\":\"success\",\"result\":{\"type\":\"device\",\"value\":{\"id\":\"GPU-healthy\",\"driver\":\"nvidia-nvml\",\"name\":\"Healthy GPU\",\"details\":{}}}}'; done",
+            )?,
+            None,
+        )?;
+        let healthy = discover_configured_with_helper(
+            "healthy-gpu",
+            "GPU-healthy",
+            healthy,
+            Duration::from_secs(1),
+        )?;
+        assert_eq!(healthy.id, "GPU-healthy");
+        assert_eq!(healthy.details.get("alias"), Some(&"healthy-gpu".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn non_terminal_configured_discovery_failure_still_fails_preflight() -> anyhow::Result<()> {
+        let missing = HelperClient::supervise(
+            "missing-gpu",
+            test_helper(
+                "while IFS= read -r line; do printf '%s\\n' '{\"status\":\"error\",\"message\":\"GPU not found\",\"terminal\":false}'; done",
+            )?,
+            None,
+        )?;
+        let Err(error) = discover_configured_with_helper(
+            "missing-gpu",
+            "GPU-missing",
+            missing,
+            Duration::from_secs(1),
+        ) else {
+            anyhow::bail!("missing configured GPU unexpectedly passed preflight");
+        };
+        assert!(error.to_string().contains("GPU not found"));
         Ok(())
     }
 
