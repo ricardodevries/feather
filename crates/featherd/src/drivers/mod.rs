@@ -2,6 +2,8 @@
 
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use serde_json::Value;
 
@@ -40,12 +42,15 @@ mod corsair;
 #[cfg(target_os = "linux")]
 mod hwmon;
 #[cfg(target_os = "linux")]
-mod nvidia;
+pub(crate) mod nvidia;
 #[cfg(target_os = "linux")]
 mod wireview;
 
 /// Hardware operations used by the policy engine.
 pub trait Hardware: Send + 'static {
+    /// Supplies a progress counter used to prove bounded driver waits remain alive.
+    fn set_heartbeat(&mut self, _heartbeat: Arc<AtomicU64>) {}
+
     /// Validates configured selectors and returns the selected devices.
     ///
     /// # Errors
@@ -77,6 +82,29 @@ pub trait Hardware: Send + 'static {
     ///
     /// Returns an error when the output is not a fan or its driver rejects the write.
     fn set_fan(&mut self, alias: &str, config: &OutputConfig, percent: u8) -> Result<FanWrite>;
+
+    /// Whether an unchanged fan target must be periodically written again.
+    ///
+    /// Stateful controllers may require refreshes. NVIDIA's manual fan policy
+    /// retains its target, so avoiding unchanged writes materially reduces
+    /// synchronous NVML traffic.
+    fn fan_needs_periodic_refresh(&self, _config: &OutputConfig) -> bool {
+        true
+    }
+
+    /// Reports a known driver failure before an otherwise unnecessary fan write.
+    ///
+    /// This is a local health check and must not perform hardware I/O.
+    fn check_fan_health(&self, _config: &OutputConfig) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether failures for this fan are isolated from the daemon failure limit.
+    ///
+    /// This is a local health check and must not perform hardware I/O.
+    fn fan_failure_is_isolated(&self, _config: &OutputConfig) -> bool {
+        false
+    }
 
     /// Sets a configured RGB output and returns observed data.
     ///
@@ -154,6 +182,10 @@ impl Default for SystemHardware {
 
 #[cfg(target_os = "linux")]
 impl Hardware for SystemHardware {
+    fn set_heartbeat(&mut self, heartbeat: Arc<AtomicU64>) {
+        self.nvidia.set_heartbeat(heartbeat);
+    }
+
     fn preflight(&mut self, config: &Config) -> Result<Vec<DeviceDescriptor>> {
         let mut discovered = Vec::new();
         let mut driver_errors = Vec::new();
@@ -162,7 +194,10 @@ impl Hardware for SystemHardware {
             Ok(mut devices) => discovered.append(&mut devices),
             Err(error) => driver_errors.push(error.to_string()),
         }
-        match self.nvidia.discover_configured(&config.devices) {
+        match self
+            .nvidia
+            .discover_configured(&config.devices, config.daemon.driver_timeout)
+        {
             Ok(mut devices) => discovered.append(&mut devices),
             Err(error) => driver_errors.push(error.to_string()),
         }
@@ -206,6 +241,8 @@ impl Hardware for SystemHardware {
     }
 
     fn commit_config(&mut self, config: &Config) {
+        self.nvidia.retain_configured(&config.devices);
+        self.nvidia.set_timeout(config.daemon.driver_timeout);
         self.devices.clone_from(&config.devices);
     }
 
@@ -288,6 +325,38 @@ impl Hardware for SystemHardware {
                 "WireView devices do not expose system fan control".into(),
             )),
         }
+    }
+
+    fn fan_needs_periodic_refresh(&self, config: &OutputConfig) -> bool {
+        let OutputConfig::Fan { device, .. } = config else {
+            return false;
+        };
+        !matches!(
+            self.devices.get(device),
+            Some(DeviceConfig::NvidiaNvml { .. })
+        )
+    }
+
+    fn check_fan_health(&self, config: &OutputConfig) -> Result<()> {
+        let OutputConfig::Fan { device, .. } = config else {
+            return Ok(());
+        };
+        let Some(device_config) = self.devices.get(device) else {
+            return Ok(());
+        };
+        match device_config {
+            DeviceConfig::NvidiaNvml { .. } => self.nvidia.check_health(device_config),
+            DeviceConfig::CorsairIcueLink { .. } | DeviceConfig::WireViewProIi { .. } => Ok(()),
+        }
+    }
+
+    fn fan_failure_is_isolated(&self, config: &OutputConfig) -> bool {
+        let OutputConfig::Fan { device, .. } = config else {
+            return false;
+        };
+        self.devices
+            .get(device)
+            .is_some_and(|device_config| self.nvidia.is_quarantined(device_config))
     }
 
     fn set_rgb(&mut self, alias: &str, config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {

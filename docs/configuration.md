@@ -6,7 +6,7 @@ Start with [`config.example.toml`](../config.example.toml). Feather rejects unkn
 
 The file has six sections:
 
-1. `daemon` sets polling, stale-reading, socket, saved-state, and failure behavior.
+1. `daemon` sets polling, stale-reading, socket, saved-state, driver-timeout, and failure behavior.
 2. `devices` names physical controllers.
 3. `sensors` names temperature sources.
 4. `curves`, `color_curves`, and `schedules` hold policy data.
@@ -65,6 +65,12 @@ Feather calls NVML through [`nvml-wrapper`](https://github.com/rust-nvml/nvml-wr
 
 Select GPUs by UUID. An empty fan `channels` list selects every reported fan. While `featherd` runs, selected fans use manual control. Shutdown restores the NVIDIA default fan policy.
 
+Each configured GPU is accessed through its own supervised helper process. A blocked NVML call is limited by `daemon.driver_timeout`, which defaults to five seconds. On a timeout or reset-required error, Feather quarantines only that GPU helper, marks its sensor and fan output degraded, and continues controlling non-NVIDIA hardware and other GPUs. Reset the affected GPU, then restart `featherd` to create a fresh helper.
+
+If the helper becomes unresponsive while the GPU uses manual fan control, Feather cannot issue the cleanup call that restores automatic policy. The GPU may retain its last accepted fan target until it is reset or the host is rebooted. Other outputs that depend on its now-stale temperature reading move to their configured fail-safe targets.
+
+NVIDIA's manual fan policy retains the last target. Feather therefore writes a GPU fan target only when the requested percentage changes; `refresh_interval` continues to apply to controllers that require periodic refreshes. Fan count and speed limits are cached, and a successful fan write is reported directly instead of immediately issuing redundant NVML verification reads.
+
 The daemon loads `libnvidia-ml.so.1` from the installed driver. No NVIDIA SDK is needed at build time. NVML fan writes require `CAP_SYS_ADMIN`, which the packaged systemd service grants to `featherd`.
 
 ## WireView Pro II
@@ -96,9 +102,10 @@ The daemon keeps its current socket and state-file paths during a reload. Restar
 
 - A missing or stale required sensor sends its fan output to `fail_safe_percent`.
 - RGB outputs turn off when their sensors are unavailable.
-- Repeated fan-write failures stop the daemon after `daemon.failure_limit` attempts.
+- Repeated fan-write failures stop the daemon after `daemon.failure_limit` attempts, except isolated NVIDIA failures.
+- A timed-out or reset-required NVIDIA helper is quarantined; other hardware control continues.
 - RGB and display failures remain degraded and retry without stopping fan control.
-- SIGINT, SIGTERM, reload, and systemd stop restore Corsair and NVIDIA fan policy.
+- Graceful SIGINT, SIGTERM, reload, and systemd stop restore Corsair and responsive NVIDIA fan policy.
 - A scheduled WireView remains in its last state when the daemon stops.
 - Profiles assign every configured output on a physical device or none of them because a Corsair hub changes control mode per device.
 - The socket server permits 32 clients and closes requests that take longer than 10 seconds.

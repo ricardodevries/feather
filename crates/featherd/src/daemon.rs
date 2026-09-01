@@ -287,13 +287,14 @@ fn spawn_engine(
     socket_path: PathBuf,
     state_path: PathBuf,
     persisted_profile: Option<String>,
-    hardware: Box<dyn Hardware>,
+    mut hardware: Box<dyn Hardware>,
 ) -> Result<EngineWorker> {
     let (sender, receiver) = mpsc::sync_channel(ENGINE_QUEUE_CAPACITY);
     let (ready_tx, ready) = oneshot::channel();
     let (stopped_tx, stopped) = oneshot::channel();
     let heartbeat = Arc::new(AtomicU64::new(0));
     let worker_heartbeat = Arc::clone(&heartbeat);
+    hardware.set_heartbeat(Arc::clone(&worker_heartbeat));
     let thread = thread::Builder::new()
         .name("featherd-hardware".into())
         .spawn(move || {

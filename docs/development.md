@@ -39,6 +39,6 @@ The release workflow runs for tags matching `v*`. It requires the tag to equal t
 Prepare a release by changing the workspace version and `Cargo.lock`, updating the documentation, and running the local and Linux checks. Commit those changes before creating the tag:
 
 ```sh
-git tag v0.1.2
-git push origin main v0.1.2
+git tag v0.1.3
+git push origin main v0.1.3
 ```
