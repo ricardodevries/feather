@@ -398,6 +398,7 @@ impl Engine {
         let needs_periodic_refresh = self.hardware.fan_needs_periodic_refresh(config);
         let needs_write = self.outputs.get(output_name).is_none_or(|runtime| {
             runtime.last_target.as_ref() != Some(&target)
+                || runtime.consecutive_failures > 0
                 || needs_periodic_refresh
                     && runtime
                         .last_write
@@ -1404,6 +1405,36 @@ off_schedule = "night"
         }
 
         assert_eq!(lock_state(&state).fan_writes.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn nvidia_fan_retries_after_a_transient_error() -> anyhow::Result<()> {
+        let (mut engine, state) = test_engine(NVIDIA_OUTPUT_CONFIG, Some(50.0))?;
+        let now = Instant::now();
+        assert!(!engine.tick(now, Local::now()));
+
+        {
+            let mut state = lock_state(&state);
+            state.sensor = Some(60.0);
+            state.fan_error = Some("temporary NVML failure".into());
+        }
+        assert!(!engine.tick(now + Duration::from_secs(1), Local::now()));
+
+        {
+            let mut state = lock_state(&state);
+            state.sensor = Some(50.0);
+            state.fan_error = None;
+        }
+        assert!(!engine.tick(now + Duration::from_secs(2), Local::now()));
+
+        assert_eq!(
+            lock_state(&state).fan_writes,
+            vec![("gpu_fans".into(), 50), ("gpu_fans".into(), 50)]
+        );
+        let status = engine.status(now + Duration::from_secs(2));
+        assert_eq!(status.outputs["gpu_fans"].health, Health::Healthy);
+        assert_eq!(status.outputs["gpu_fans"].error, None);
         Ok(())
     }
 

@@ -164,7 +164,6 @@ impl Default for SystemHardware {
 #[cfg(target_os = "linux")]
 impl Hardware for SystemHardware {
     fn preflight(&mut self, config: &Config) -> Result<Vec<DeviceDescriptor>> {
-        self.nvidia.set_timeout(config.daemon.driver_timeout);
         let mut discovered = Vec::new();
         let mut driver_errors = Vec::new();
 
@@ -172,7 +171,10 @@ impl Hardware for SystemHardware {
             Ok(mut devices) => discovered.append(&mut devices),
             Err(error) => driver_errors.push(error.to_string()),
         }
-        match self.nvidia.discover_configured(&config.devices) {
+        match self
+            .nvidia
+            .discover_configured(&config.devices, config.daemon.driver_timeout)
+        {
             Ok(mut devices) => discovered.append(&mut devices),
             Err(error) => driver_errors.push(error.to_string()),
         }
@@ -217,6 +219,7 @@ impl Hardware for SystemHardware {
 
     fn commit_config(&mut self, config: &Config) {
         self.nvidia.retain_configured(&config.devices);
+        self.nvidia.set_timeout(config.daemon.driver_timeout);
         self.devices.clone_from(&config.devices);
     }
 

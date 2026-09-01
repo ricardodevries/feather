@@ -19,6 +19,7 @@ use feather_core::{
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const HELPER_REPLY_GRACE: Duration = Duration::from_secs(1);
+const MAX_SHUTDOWN_REQUEST_TIMEOUT: Duration = DEFAULT_REQUEST_TIMEOUT;
 const NVIDIA_HELPER_ARGUMENT: &str = "--nvidia-helper";
 
 /// Parent-side supervisor. Runtime requests use one helper process per GPU so
@@ -54,16 +55,17 @@ impl NvidiaDriver {
             .filter(|uuid| !retained.contains(uuid.as_str()))
             .cloned()
             .collect::<Vec<_>>();
-        for uuid in removed {
-            if let Some(mut helper) = self.helpers.remove(&uuid) {
-                helper.shutdown(self.timeout);
-            }
-        }
+        let helpers: Vec<_> = removed
+            .into_iter()
+            .filter_map(|uuid| self.helpers.remove(&uuid).map(|helper| (uuid, helper)))
+            .collect();
+        shutdown_helpers(helpers, self.timeout);
     }
 
     pub(super) fn discover_configured(
         &mut self,
         configured: &BTreeMap<String, DeviceConfig>,
+        timeout: Duration,
     ) -> Result<Vec<DeviceDescriptor>> {
         if !configured
             .values()
@@ -71,7 +73,7 @@ impl NvidiaDriver {
         {
             return Ok(Vec::new());
         }
-        let all = self.discover_all()?;
+        let all = self.discover_all_with_timeout(timeout)?;
         let mut found = Vec::new();
         for (alias, config) in configured {
             let DeviceConfig::NvidiaNvml { uuid } = config else {
@@ -87,9 +89,13 @@ impl NvidiaDriver {
     }
 
     pub(super) fn discover_all(&mut self) -> Result<Vec<DeviceDescriptor>> {
+        self.discover_all_with_timeout(self.timeout)
+    }
+
+    fn discover_all_with_timeout(&mut self, timeout: Duration) -> Result<Vec<DeviceDescriptor>> {
         let mut helper = HelperClient::spawn("discovery")?;
-        let response = helper.call(HelperRequest::DiscoverAll, self.timeout);
-        helper.shutdown(self.timeout);
+        let response = helper.call(HelperRequest::DiscoverAll, timeout);
+        helper.shutdown(timeout);
         match response? {
             HelperResult::Devices(devices) => Ok(devices),
             other => Err(unexpected_response("device discovery", &other)),
@@ -150,11 +156,7 @@ impl NvidiaDriver {
     }
 
     pub(super) fn shutdown(&mut self) {
-        for (uuid, mut helper) in std::mem::take(&mut self.helpers) {
-            if let Err(error) = helper.call(HelperRequest::Shutdown, self.timeout) {
-                tracing::error!(%error, gpu_uuid = uuid, "failed to stop NVIDIA helper");
-            }
-        }
+        shutdown_helpers(std::mem::take(&mut self.helpers), self.timeout);
     }
 
     fn request_for(&mut self, uuid: &str, request: HelperRequest) -> Result<HelperResult> {
@@ -167,6 +169,22 @@ impl NvidiaDriver {
             .ok_or_else(|| FeatherError::Driver(format!("NVIDIA helper for {uuid} is missing")))?
             .call(request, self.timeout)
     }
+}
+
+fn shutdown_helpers(
+    helpers: impl IntoIterator<Item = (String, HelperClient)>,
+    request_timeout: Duration,
+) {
+    let request_timeout = request_timeout.min(MAX_SHUTDOWN_REQUEST_TIMEOUT);
+    thread::scope(|scope| {
+        for (uuid, mut helper) in helpers {
+            scope.spawn(move || {
+                if let Err(error) = helper.call(HelperRequest::Shutdown, request_timeout) {
+                    tracing::error!(%error, gpu_uuid = uuid, "failed to stop NVIDIA helper");
+                }
+            });
+        }
+    });
 }
 
 impl Drop for NvidiaDriver {
@@ -189,7 +207,7 @@ impl HelperClient {
                 error,
             )
         })?;
-        let mut child = Command::new(executable)
+        let child = Command::new(executable)
             .arg(NVIDIA_HELPER_ARGUMENT)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -198,6 +216,10 @@ impl HelperClient {
             .map_err(|error| {
                 nvidia_error(format!("could not start NVIDIA helper for {label}"), error)
             })?;
+        Self::supervise(label, child)
+    }
+
+    fn supervise(label: &str, mut child: Child) -> Result<Self> {
         let stdin = child.stdin.take().ok_or_else(|| {
             FeatherError::Driver(format!("NVIDIA helper for {label} has no standard input"))
         })?;
@@ -746,7 +768,7 @@ mod tests {
         ));
         assert!(terminal_nvidia_error("GPU has fallen off the bus"));
         assert!(terminal_nvidia_error(
-            "device fell off the bus or has otherwise become inacessible"
+            "device fell off the bus or has otherwise become inaccessible"
         ));
         assert!(!terminal_nvidia_error("temporarily unavailable"));
     }
@@ -766,5 +788,66 @@ mod tests {
             HelperRequest::SetFans { percent: 42, .. }
         ));
         Ok(())
+    }
+
+    #[test]
+    fn a_timed_out_helper_is_killed_quarantined_and_isolated() -> anyhow::Result<()> {
+        let stalled_child = test_helper("exec sleep 60")?;
+        let stalled_pid = stalled_child.id();
+        let mut stalled = HelperClient::supervise("stalled", stalled_child)?;
+        let mut responsive = HelperClient::supervise(
+            "responsive",
+            test_helper(
+                "while IFS= read -r line; do printf '%s\\n' '{\"status\":\"success\",\"result\":{\"type\":\"unit\"}}'; done",
+            )?,
+        )?;
+        let timeout = Duration::from_millis(500);
+
+        thread::scope(|scope| -> anyhow::Result<()> {
+            let stalled_call = scope.spawn(|| stalled.call(HelperRequest::DiscoverAll, timeout));
+            thread::sleep(Duration::from_millis(50));
+
+            let responsive_started = std::time::Instant::now();
+            assert!(matches!(
+                responsive.call(HelperRequest::DiscoverAll, timeout)?,
+                HelperResult::Unit
+            ));
+            assert!(responsive_started.elapsed() < Duration::from_millis(250));
+
+            let stalled_result = stalled_call
+                .join()
+                .map_err(|_| anyhow::anyhow!("stalled helper test thread panicked"))?;
+            let Err(error) = stalled_result else {
+                anyhow::bail!("non-replying helper unexpectedly replied");
+            };
+            assert!(error.to_string().contains("quarantined"));
+            Ok(())
+        })?;
+
+        let retry_started = std::time::Instant::now();
+        let Err(retry_error) = stalled.call(HelperRequest::DiscoverAll, timeout) else {
+            anyhow::bail!("quarantined helper accepted another request");
+        };
+        assert!(retry_error.to_string().contains("quarantined"));
+        assert!(retry_started.elapsed() < Duration::from_millis(100));
+
+        for _ in 0..100 {
+            if !std::path::Path::new(&format!("/proc/{stalled_pid}")).exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!std::path::Path::new(&format!("/proc/{stalled_pid}")).exists());
+        responsive.shutdown(timeout);
+        Ok(())
+    }
+
+    fn test_helper(script: &str) -> std::io::Result<Child> {
+        Command::new("sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
     }
 }
