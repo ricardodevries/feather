@@ -99,6 +99,13 @@ pub trait Hardware: Send + 'static {
         Ok(())
     }
 
+    /// Whether failures for this fan are isolated from the daemon failure limit.
+    ///
+    /// This is a local health check and must not perform hardware I/O.
+    fn fan_failure_is_isolated(&self, _config: &OutputConfig) -> bool {
+        false
+    }
+
     /// Sets a configured RGB output and returns observed data.
     ///
     /// # Errors
@@ -341,6 +348,15 @@ impl Hardware for SystemHardware {
             DeviceConfig::NvidiaNvml { .. } => self.nvidia.check_health(device_config),
             DeviceConfig::CorsairIcueLink { .. } | DeviceConfig::WireViewProIi { .. } => Ok(()),
         }
+    }
+
+    fn fan_failure_is_isolated(&self, config: &OutputConfig) -> bool {
+        let OutputConfig::Fan { device, .. } = config else {
+            return false;
+        };
+        self.devices
+            .get(device)
+            .is_some_and(|device_config| self.nvidia.is_quarantined(device_config))
     }
 
     fn set_rgb(&mut self, alias: &str, config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {

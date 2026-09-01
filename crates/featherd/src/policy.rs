@@ -9,7 +9,7 @@ use chrono::{DateTime, Local, Timelike};
 use serde_json::{Value, json};
 
 use feather_core::{
-    config::{AssignmentConfig, Config, DeviceConfig, OutputConfig},
+    config::{AssignmentConfig, Config, OutputConfig},
     curve::{interpolate_color, interpolate_fan, schedule_active},
     error::{FeatherError, Result},
     types::{
@@ -423,13 +423,10 @@ impl Engine {
     }
 
     fn fan_failure_stops_daemon(&self, output_name: &str) -> bool {
-        let Some(OutputConfig::Fan { device, .. }) = self.config.outputs.get(output_name) else {
+        let Some(config @ OutputConfig::Fan { .. }) = self.config.outputs.get(output_name) else {
             return false;
         };
-        !matches!(
-            self.config.devices.get(device),
-            Some(DeviceConfig::NvidiaNvml { .. })
-        )
+        !self.hardware.fan_failure_is_isolated(config)
     }
 
     fn write_rgb(
@@ -1159,6 +1156,7 @@ off_schedule = "night"
         fan_warning: Option<String>,
         fan_error: Option<String>,
         fan_health_error: Option<String>,
+        fan_failure_isolated: bool,
         releases: Vec<String>,
         preflights: usize,
         commits: usize,
@@ -1215,6 +1213,10 @@ off_schedule = "night"
                 Some(error) => Err(FeatherError::Driver(error.clone())),
                 None => Ok(()),
             }
+        }
+
+        fn fan_failure_is_isolated(&self, _config: &OutputConfig) -> bool {
+            lock_state(&self.state).fan_failure_isolated
         }
 
         fn set_rgb(&mut self, _alias: &str, _config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {
@@ -1385,7 +1387,11 @@ off_schedule = "night"
     #[test]
     fn nvidia_fan_failures_degrade_without_stopping_other_control() -> anyhow::Result<()> {
         let (mut engine, state) = test_engine(NVIDIA_OUTPUT_CONFIG, Some(50.0))?;
-        lock_state(&state).fan_error = Some("NVIDIA helper is quarantined".into());
+        {
+            let mut state = lock_state(&state);
+            state.fan_error = Some("NVIDIA helper is quarantined".into());
+            state.fan_failure_isolated = true;
+        }
         let now = Instant::now();
 
         for seconds in 0..10 {
@@ -1401,6 +1407,18 @@ off_schedule = "night"
                 .as_deref()
                 .is_some_and(|error| error.contains("quarantined"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn non_quarantined_nvidia_fan_failures_reach_the_failure_limit() -> anyhow::Result<()> {
+        let (mut engine, state) = test_engine(NVIDIA_OUTPUT_CONFIG, Some(50.0))?;
+        lock_state(&state).fan_error = Some("NVML permission denied".into());
+        let now = Instant::now();
+
+        assert!(!engine.tick(now, Local::now()));
+        assert!(!engine.tick(now + Duration::from_secs(1), Local::now()));
+        assert!(engine.tick(now + Duration::from_secs(2), Local::now()));
         Ok(())
     }
 

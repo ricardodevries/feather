@@ -177,6 +177,13 @@ impl NvidiaDriver {
         }
     }
 
+    pub(super) fn is_quarantined(&self, config: &DeviceConfig) -> bool {
+        uuid(config)
+            .ok()
+            .and_then(|uuid| self.helpers.get(uuid))
+            .is_some_and(|helper| helper.failure_reason().is_some())
+    }
+
     pub(super) fn shutdown(&mut self) {
         shutdown_helpers(std::mem::take(&mut self.helpers), self.timeout);
     }
