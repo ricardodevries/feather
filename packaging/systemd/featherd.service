@@ -13,6 +13,7 @@ ExecStart=/usr/local/bin/featherd --config /etc/feather/config.toml
 ExecReload=/usr/local/bin/feather config reload
 Restart=on-failure
 RestartSec=30s
+KillMode=mixed
 TimeoutStopSec=15s
 WatchdogSec=15s
 User=root

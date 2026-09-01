@@ -388,6 +388,7 @@ impl Engine {
         health: Health,
         now: Instant,
     ) -> Result<()> {
+        self.hardware.check_fan_health(config)?;
         let refresh = match config {
             OutputConfig::Fan {
                 refresh_interval, ..
@@ -1157,6 +1158,7 @@ off_schedule = "night"
         display_error: Option<String>,
         fan_warning: Option<String>,
         fan_error: Option<String>,
+        fan_health_error: Option<String>,
         releases: Vec<String>,
         preflights: usize,
         commits: usize,
@@ -1206,6 +1208,13 @@ off_schedule = "night"
 
         fn fan_needs_periodic_refresh(&self, config: &OutputConfig) -> bool {
             !matches!(config, OutputConfig::Fan { device, .. } if device == "gpu0")
+        }
+
+        fn check_fan_health(&self, _config: &OutputConfig) -> Result<()> {
+            match &lock_state(&self.state).fan_health_error {
+                Some(error) => Err(FeatherError::Driver(error.clone())),
+                None => Ok(()),
+            }
         }
 
         fn set_rgb(&mut self, _alias: &str, _config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {
@@ -1405,6 +1414,28 @@ off_schedule = "night"
         }
 
         assert_eq!(lock_state(&state).fan_writes.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn nvidia_quarantine_degrades_an_unchanged_fan_output_without_rewriting() -> anyhow::Result<()>
+    {
+        let (mut engine, state) = test_engine(NVIDIA_OUTPUT_CONFIG, Some(50.0))?;
+        let now = Instant::now();
+        assert!(!engine.tick(now, Local::now()));
+        lock_state(&state).fan_health_error = Some("NVIDIA helper is quarantined".into());
+
+        assert!(!engine.tick(now + Duration::from_secs(1), Local::now()));
+
+        assert_eq!(lock_state(&state).fan_writes.len(), 1);
+        let status = engine.status(now + Duration::from_secs(1));
+        assert_eq!(status.outputs["gpu_fans"].health, Health::Degraded);
+        assert!(
+            status.outputs["gpu_fans"]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("quarantined"))
+        );
         Ok(())
     }
 

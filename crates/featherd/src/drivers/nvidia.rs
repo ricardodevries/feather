@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -164,6 +165,17 @@ impl NvidiaDriver {
         }
     }
 
+    pub(super) fn check_health(&self, config: &DeviceConfig) -> Result<()> {
+        let uuid = uuid(config)?;
+        let Some(helper) = self.helpers.get(uuid) else {
+            return Ok(());
+        };
+        match &helper.quarantined {
+            Some(reason) => Err(quarantined_error(&helper.label, reason)),
+            None => Ok(()),
+        }
+    }
+
     pub(super) fn shutdown(&mut self) {
         shutdown_helpers(std::mem::take(&mut self.helpers), self.timeout);
     }
@@ -213,15 +225,16 @@ struct HelperClient {
 
 impl HelperClient {
     fn spawn(label: &str, heartbeat: Option<Arc<AtomicU64>>) -> Result<Self> {
-        let child = Command::new("/proc/self/exe")
+        let mut command = Command::new("/proc/self/exe");
+        command
             .arg(NVIDIA_HELPER_ARGUMENT)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| {
-                nvidia_error(format!("could not start NVIDIA helper for {label}"), error)
-            })?;
+            .stderr(Stdio::inherit());
+        isolate_process_group(&mut command);
+        let child = command.spawn().map_err(|error| {
+            nvidia_error(format!("could not start NVIDIA helper for {label}"), error)
+        })?;
         Self::supervise(label, child, heartbeat)
     }
 
@@ -334,6 +347,10 @@ impl HelperClient {
         self.quarantined = Some(reason.clone());
         Err(quarantined_error(&self.label, &reason))
     }
+}
+
+fn isolate_process_group(command: &mut Command) {
+    command.process_group(0);
 }
 
 struct ManagerRequest {
@@ -896,6 +913,30 @@ mod tests {
         }
         assert!(!std::path::Path::new(&format!("/proc/{stalled_pid}")).exists());
         responsive.shutdown(timeout);
+        Ok(())
+    }
+
+    #[test]
+    fn helper_processes_use_a_separate_process_group() -> anyhow::Result<()> {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate_process_group(&mut command);
+        let mut child = command.spawn()?;
+        let pid = child.id();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let process_group = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(2))
+            .ok_or_else(|| anyhow::anyhow!("could not read process group from {stat}"))?
+            .parse::<u32>()?;
+        child.kill()?;
+        child.wait()?;
+
+        assert_eq!(process_group, pid);
         Ok(())
     }
 

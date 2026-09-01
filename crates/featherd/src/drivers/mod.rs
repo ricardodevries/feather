@@ -92,6 +92,13 @@ pub trait Hardware: Send + 'static {
         true
     }
 
+    /// Reports a known driver failure before an otherwise unnecessary fan write.
+    ///
+    /// This is a local health check and must not perform hardware I/O.
+    fn check_fan_health(&self, _config: &OutputConfig) -> Result<()> {
+        Ok(())
+    }
+
     /// Sets a configured RGB output and returns observed data.
     ///
     /// # Errors
@@ -321,6 +328,19 @@ impl Hardware for SystemHardware {
             self.devices.get(device),
             Some(DeviceConfig::NvidiaNvml { .. })
         )
+    }
+
+    fn check_fan_health(&self, config: &OutputConfig) -> Result<()> {
+        let OutputConfig::Fan { device, .. } = config else {
+            return Ok(());
+        };
+        let Some(device_config) = self.devices.get(device) else {
+            return Ok(());
+        };
+        match device_config {
+            DeviceConfig::NvidiaNvml { .. } => self.nvidia.check_health(device_config),
+            DeviceConfig::CorsairIcueLink { .. } | DeviceConfig::WireViewProIi { .. } => Ok(()),
+        }
     }
 
     fn set_rgb(&mut self, alias: &str, config: &OutputConfig, rgb: [u8; 3]) -> Result<Value> {
